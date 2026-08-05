@@ -50,6 +50,7 @@ public final class Phase3E2ERunner {
             case "MULTI_ACTIVE_FAILURE" -> multiActiveFailure(base);
             case "MULTI_ACTIVE_TIMEOUT" -> multiActiveTimeout(base);
             case "CORRELATED_ERROR" -> correlatedError(base);
+            case "CAPACITY_MISMATCH" -> capacityMismatch(base);
             case "SHUTDOWN" -> shutdown(base);
             case "SHUTDOWN_TIMEOUT" -> shutdownTimeout(base);
             default -> throw new IllegalArgumentException("Unsupported Phase 3 E2E scenario: " + args[0]);
@@ -239,6 +240,68 @@ public final class Phase3E2ERunner {
         }
     }
 
+    private static void capacityMismatch(ApplicationConfig base) throws Exception {
+        CapacityMismatchFixture fixture = CapacityMismatchFixture.create();
+        ApplicationConfig config = withPythonExecutable(
+                configured(base, 1, 2, 4, 2_000, 5_000, 2_000), fixture.wrapper().toString());
+        ExecutorService callers = Executors.newFixedThreadPool(2);
+        Set<Long> originalPids = Set.of();
+        Path originalSocket = null;
+        try {
+            PythonCallUtil.initialize(PythonCallMode.MANAGED_RUNTIME, config);
+            originalPids = waitForWorkerCount(1, 5_000);
+            Path runtimeDirectory = onlyRuntimeDirectory(config);
+            originalSocket = runtimeDirectory.resolve("worker-1-g1.sock");
+            require(Files.exists(originalSocket), "Original worker socket was not created");
+
+            CompletableFuture<Observation> first = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return request(config, "capacity-mismatch-sibling", 1_500, Map.of());
+                } catch (Exception failure) {
+                    throw new CompletionException(failure);
+                }
+            }, callers);
+            Thread.sleep(150);
+            CompletableFuture<Observation> second = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return request(config, "capacity-mismatch-affected", 1_500, Map.of());
+                } catch (Exception failure) {
+                    throw new CompletionException(failure);
+                }
+            }, callers);
+
+            List<Outcome> results = outcomes(List.of(first, second), 5_000);
+            require(results.stream().allMatch(outcome -> outcome.failure != null),
+                    "CAPACITY_EXCEEDED did not fail the affected request and its sibling");
+            require(results.stream().allMatch(Outcome::terminal),
+                    "A capacity-mismatch future was not terminal");
+            require(results.stream().allMatch(outcome ->
+                            messageChain(outcome.failure).contains("code=CAPACITY_EXCEEDED")),
+                    "The genuine Python CAPACITY_EXCEEDED error was not observed by every failed assignment");
+
+            Set<Long> replacementPids = waitForChangedPool(originalPids, 1, 8_000);
+            verifyPidsGone(originalPids, 3_000);
+            Path socketToCheck = originalSocket;
+            waitUntil(() -> !Files.exists(socketToCheck), 3_000,
+                    "Original capacity-mismatched worker socket was not removed: " + originalSocket);
+            Observation subsequent = request(config, "after-capacity-mismatch", 10, Map.of());
+            require(subsequent.response.statusCode() == 200,
+                    "Replacement worker was not usable after the capacity mismatch");
+            verifyMappings(List.of(subsequent));
+            System.out.printf("Phase 3 CAPACITY_MISMATCH passed: javaCapacity=2, pythonCapacity=1, "
+                            + "originalPid=%s, replacementPid=%s, failedAssignments=2, "
+                            + "capacityExceededObserved=true, siblingFailedWithoutRetry=true, "
+                            + "allFuturesTerminal=true, oldSocketRemoved=true, replacementUsable=true%n",
+                    originalPids, replacementPids);
+        } finally {
+            try {
+                shutdownAndVerify(config, callers);
+            } finally {
+                fixture.close();
+            }
+        }
+    }
+
     private static void shutdown(ApplicationConfig base) throws Exception {
         ApplicationConfig config = configured(base, 2, 3, 4, 2_000, 5_000, 2_000);
         ExecutorService callers = Executors.newFixedThreadPool(11);
@@ -423,6 +486,30 @@ public final class Phase3E2ERunner {
         return new ApplicationConfig(base.fastApi(), base.workload(), base.httpClient(), managed);
     }
 
+    private static ApplicationConfig withPythonExecutable(ApplicationConfig config, String pythonExecutable) {
+        ManagedPythonRuntimeConfig value = config.managedPythonRuntime();
+        ManagedPythonRuntimeConfig managed = new ManagedPythonRuntimeConfig(
+                pythonExecutable, value.applicationDirectory(), value.udsDirectory(),
+                value.workerCount(), value.maxInFlightPerWorker(), value.queueCapacity(),
+                value.queueTimeoutMs(), value.maxFrameBytes(), value.startupTimeoutMs(),
+                value.requestTimeoutMs(), value.shutdownTimeoutMs(), value.restartEnabled(),
+                value.restartInitialBackoffMs(), value.restartMaximumBackoffMs(),
+                value.restartMaxAttempts(), value.restartWindowMs());
+        return new ApplicationConfig(config.fastApi(), config.workload(), config.httpClient(), managed);
+    }
+
+    private static Path onlyRuntimeDirectory(ApplicationConfig config) throws Exception {
+        Path parent = Path.of(config.managedPythonRuntime().udsDirectory()).toAbsolutePath().normalize();
+        try (var paths = Files.list(parent)) {
+            List<Path> runtimeDirectories = paths
+                    .filter(path -> path.getFileName().toString().startsWith("runtime-pool-"))
+                    .toList();
+            require(runtimeDirectories.size() == 1,
+                    "Expected one managed runtime directory, observed " + runtimeDirectories);
+            return runtimeDirectories.get(0);
+        }
+    }
+
     private static Set<Long> workerPids() {
         Set<Long> pids = new HashSet<>();
         ProcessHandle.current().descendants()
@@ -520,6 +607,70 @@ public final class Phase3E2ERunner {
     private record Outcome(Observation result, Throwable failure) {
         private boolean terminal() {
             return result != null || failure != null;
+        }
+    }
+
+    private record CapacityMismatchFixture(
+            Path directory,
+            Path wrapper,
+            Path driver,
+            Path firstInvocationMarker) implements AutoCloseable {
+
+        private static CapacityMismatchFixture create() throws Exception {
+            Path directory = Files.createTempDirectory("phase3-capacity-mismatch-");
+            Path wrapper = directory.resolve("python-capacity-mismatch");
+            Path driver = directory.resolve("capacity_mismatch_driver.py");
+            Path marker = directory.resolve("first-worker-invocation");
+            Files.writeString(driver, """
+                    import asyncio
+                    import os
+                    import sys
+                    from pathlib import Path
+
+                    sys.path.insert(0, os.getcwd())
+                    from python_runtime import worker_runtime as runtime
+
+
+                    def argument(name: str) -> str:
+                        index = sys.argv.index(name)
+                        return sys.argv[index + 1]
+
+
+                    socket_path = Path(argument("--socket-path"))
+                    max_frame_bytes = int(argument("--max-frame-bytes"))
+                    configured_capacity = int(argument("--max-in-flight-per-worker"))
+                    production_write_frame = runtime.write_frame
+
+
+                    async def write_frame_with_configured_readiness(
+                        writer, metadata, body, frame_limit
+                    ):
+                        if metadata.get("type") == "ready":
+                            metadata = dict(metadata)
+                            metadata["maxInFlightPerWorker"] = configured_capacity
+                        await production_write_frame(writer, metadata, body, frame_limit)
+
+
+                    runtime.write_frame = write_frame_with_configured_readiness
+                    asyncio.run(runtime.run_worker(socket_path, max_frame_bytes, 1))
+                    """);
+            Files.writeString(wrapper, "#!/bin/sh\n"
+                    + "set -eu\n"
+                    + "if mkdir " + marker + " 2>/dev/null; then\n"
+                    + "    exec python3 " + driver + " \"$@\"\n"
+                    + "fi\n"
+                    + "exec python3 \"$@\"\n");
+            require(wrapper.toFile().setExecutable(true, true),
+                    "Unable to make the capacity-mismatch Python wrapper executable");
+            return new CapacityMismatchFixture(directory, wrapper, driver, marker);
+        }
+
+        @Override
+        public void close() throws Exception {
+            Files.deleteIfExists(firstInvocationMarker);
+            Files.deleteIfExists(wrapper);
+            Files.deleteIfExists(driver);
+            Files.deleteIfExists(directory);
         }
     }
 }

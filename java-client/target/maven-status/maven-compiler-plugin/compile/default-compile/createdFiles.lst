@@ -11,6 +11,7 @@ com\example\baseline\e2e\Phase3E2ERunner$Observation.class
 com\example\baseline\e2e\Phase2E2ERunner.class
 com\example\baseline\utils\config\YamlConfigLoader.class
 com\example\baseline\utils\python\ManagedPythonRuntime$PoolState.class
+com\example\baseline\e2e\Phase3E2ERunner$CapacityMismatchFixture.class
 com\example\baseline\utils\config\ApplicationConfig$HttpClientConfig.class
 com\example\baseline\utils\python\PythonCallUtil$LifecycleState.class
 com\example\baseline\utils\http\HttpUtil.class

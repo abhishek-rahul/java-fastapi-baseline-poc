@@ -371,3 +371,44 @@ Environment: Windows 10 host with Docker Linux containers; final image uses Java
 ## Final statement
 
 Phase 3 complete
+
+---
+
+## Focused Phase 3 CAPACITY_EXCEEDED handling correction
+
+Date: 2026-08-06
+
+- Root cause corrected: Java treated every correlated Python `error` frame as request-specific, so `CAPACITY_EXCEEDED` released one slot and could republish a worker whose Java/Python capacity accounting disagreed.
+- `ManagedPythonWorker` now requires nonblank `code` and `message` fields. `ASGI_EXECUTION_FAILED` remains request-specific; `CAPACITY_EXCEEDED` and unknown error codes poison the complete worker generation through the existing active-registry drain, capacity reset, bounded termination, cleanup, and replacement flow.
+- Added real scenario `CAPACITY_MISMATCH`. Its E2E-only temporary executable wrapper starts the first Python generation with actual capacity one while preserving the Java readiness expectation of two. The next invocation starts the unmodified production worker with capacity two. No production failure-injection hook was added.
+
+### Commands and observed results
+
+- `cd java-client; mvn -DskipTests clean package`
+  Result: PASS - 20 main sources and 3 existing test sources compiled; shaded JAR built; total time 8.266 seconds.
+- `cd java-client; mvn test`
+  Result: PASS - 8 existing tests, 0 failures, 0 errors, 0 skipped; total time 4.654 seconds.
+- First focused `CAPACITY_MISMATCH` run
+  Result: E2E harness import-path failure before runtime initialization - the temporary driver could not import `python_runtime`. The E2E-only driver was corrected to include its current application directory; production runtime code was not changed for this issue.
+- `docker build --no-cache --progress=plain -t java-fastapi-runtime-poc .`
+  Result: PASS - the exact final source built without cache with exit code 0 in 69 seconds. An earlier attempt exported the image but exceeded its 60-second command timeout; it was rerun to obtain an unambiguous successful exit code.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E CAPACITY_MISMATCH`
+  Result: PASS - Java capacity two versus Python capacity one produced a genuine correlated `CAPACITY_EXCEEDED`; original PID 27 became unhealthy, both active assignments failed without retry and were terminal, `worker-1-g1.sock` was removed, replacement PID 43 became usable, and shutdown removed all runtime resources.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E CORRELATED_ERROR`
+  Result: PASS - `ASGI_EXECUTION_FAILED` failed one request, three siblings succeeded, PID 28 remained healthy and was reused, and released capacity served a subsequent request.
+- `docker run --rm java-fastapi-runtime-poc HTTP E2E`
+  Result: PASS - the unchanged real OkHttp/Uvicorn E2E passed.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E`
+  Result: PASS - the standard managed real-process/UDS/ASGI E2E passed.
+- Final Phase 2 capacity-one matrix: `PARALLEL`, `QUEUE`, `IDLE_FAILURE`, `BUSY_FAILURE`, `STARTUP_FAILURE`, `RESTART_EXHAUSTION`, `REQUEST_TIMEOUT`, `UNHEALTHY_FORCE_TERMINATION`, `SHUTDOWN`, and `SHUTDOWN_TIMEOUT`
+  Result: PASS - all ten scenarios passed. Observations included four-way overlap in 1,076.542 ms, every bounded queue future terminal, idle PID 31 replaced by PID 59, one non-retried busy failure with replacement PID 63, 87 ms bounded startup failure, bounded restart exhaustion, timeout replacement PID 28 to PID 41, forced unhealthy termination in 875 ms, graceful shutdown in 747 ms, and forced shutdown in 513 ms against one 500 ms deadline.
+- Final Phase 3 regression matrix: `SAME_WORKER`, `MULTI_WORKER`, `OUT_OF_ORDER`, `CAPACITY`, `MULTI_ACTIVE_FAILURE`, `MULTI_ACTIVE_TIMEOUT`, `SHUTDOWN`, and `SHUTDOWN_TIMEOUT`
+  Result: PASS - same-worker overlap was four in 560.888 ms; multi-worker overlap was six in 530.769 ms; out-of-order mappings were correct; configured active capacity never exceeded two; killed PID 29 failed three requests without retry and was replaced by PID 52; timeout-poisoned PID 27 was replaced by PID 43; graceful shutdown drained six active and failed four queued requests in 359 ms; forced shutdown made all six futures terminal in 522 ms against one 500 ms deadline.
+- `docker ps -a --filter ancestor=java-fastapi-runtime-poc --format "{{.ID}} {{.Status}} {{.Names}}"`
+  Result: PASS - output was empty after the complete matrix; no test container remained.
+- `git diff --check` and unchanged-scope source audit
+  Result: PASS - no whitespace errors; HTTP code, FastAPI application, Python runtime and ASGI adapter, public `PythonCallUtil`, protocol framing/version, configuration, CLI, Docker routing, GIL behavior, and CPU/I/O behavior remain unchanged.
+
+### Focused acceptance result
+
+PASS - `CAPACITY_EXCEEDED` now fails the affected request and all sibling assignments exactly once, removes all generation capacity, terminates and cleans the mismatched worker, and restores capacity through the existing restart policy. Normal `ASGI_EXECUTION_FAILED` behavior remains request-specific. No Phase 4 work was started.

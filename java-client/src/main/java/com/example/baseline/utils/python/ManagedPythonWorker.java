@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class ManagedPythonWorker {
     private static final Logger LOGGER = LoggerFactory.getLogger(ManagedPythonWorker.class);
     private static final long WRITER_POLL_MILLIS = 25;
+    private static final String ASGI_EXECUTION_FAILED = "ASGI_EXECUTION_FAILED";
+    private static final String CAPACITY_EXCEEDED = "CAPACITY_EXCEEDED";
 
     interface Listener {
         void onCapacityAvailable(ManagedPythonWorker worker);
@@ -453,9 +455,18 @@ final class ManagedPythonWorker {
                     finishAssignment(assignment, new PythonCallResponse(
                             status, responseHeaders(frame.metadata().get("headers")), frame.body()), null);
                 } else if ("error".equals(frame.type())) {
-                    finishAssignment(assignment, null, new IOException(
-                            "Managed Python Runtime error: "
-                                    + frame.metadata().getOrDefault("message", "unknown error")));
+                    String errorCode = stringValue(frame.metadata(), "code");
+                    String errorMessage = stringValue(frame.metadata(), "message");
+                    IOException error = pythonError(requestId, errorCode, errorMessage);
+                    if (ASGI_EXECUTION_FAILED.equals(errorCode)) {
+                        finishAssignment(assignment, null, error);
+                    } else if (CAPACITY_EXCEEDED.equals(errorCode)) {
+                        markUnhealthy(error);
+                    } else {
+                        markUnhealthy(new IOException(
+                                "Unrecognized Python worker error code; capacity and correlation integrity "
+                                        + "cannot be trusted: " + error.getMessage(), error));
+                    }
                 } else {
                     throw new IOException("Unexpected Python runtime message: " + frame.type());
                 }
@@ -700,6 +711,15 @@ final class ManagedPythonWorker {
     private TimeoutException requestTimeout() {
         return new TimeoutException("Managed Python request timed out: workerId=" + workerId
                 + ", generation=" + generation + ", pid=" + workerPid);
+    }
+
+    private IOException pythonError(String requestId, String errorCode, String errorMessage) {
+        return new IOException("Managed Python Runtime error: workerId=" + workerId
+                + ", generation=" + generation
+                + ", pid=" + workerPid
+                + ", requestId=" + requestId
+                + ", code=" + errorCode
+                + ", message=" + errorMessage);
     }
 
     private static Exception asException(String message, Throwable failure) {
