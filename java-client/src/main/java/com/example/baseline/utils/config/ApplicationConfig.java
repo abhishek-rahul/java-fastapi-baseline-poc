@@ -77,20 +77,32 @@ public record ApplicationConfig(
             @JsonProperty("python-executable") String pythonExecutable,
             @JsonProperty("application-directory") String applicationDirectory,
             @JsonProperty("uds-directory") String udsDirectory,
+            @JsonProperty("worker-count") int workerCount,
             @JsonProperty("queue-capacity") int queueCapacity,
+            @JsonProperty("queue-timeout-ms") long queueTimeoutMs,
             @JsonProperty("max-frame-bytes") int maxFrameBytes,
             @JsonProperty("startup-timeout-ms") long startupTimeoutMs,
             @JsonProperty("request-timeout-ms") long requestTimeoutMs,
-            @JsonProperty("shutdown-timeout-ms") long shutdownTimeoutMs
+            @JsonProperty("shutdown-timeout-ms") long shutdownTimeoutMs,
+            @JsonProperty("restart-enabled") boolean restartEnabled,
+            @JsonProperty("restart-initial-backoff-ms") long restartInitialBackoffMs,
+            @JsonProperty("restart-maximum-backoff-ms") long restartMaximumBackoffMs,
+            @JsonProperty("restart-max-attempts") int restartMaxAttempts,
+            @JsonProperty("restart-window-ms") long restartWindowMs
     ) {
         public void validate() {
             requireText(pythonExecutable, "managed-python-runtime.python-executable");
             requireText(applicationDirectory, "managed-python-runtime.application-directory");
             requireText(udsDirectory, "managed-python-runtime.uds-directory");
+            if (workerCount < 1 || workerCount > 64) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.worker-count must be between 1 and 64");
+            }
             if (queueCapacity <= 0) {
                 throw new IllegalArgumentException(
                         "managed-python-runtime.queue-capacity must be greater than zero");
             }
+            requirePositive(queueTimeoutMs, "managed-python-runtime.queue-timeout-ms");
             if (maxFrameBytes < 1024) {
                 throw new IllegalArgumentException(
                         "managed-python-runtime.max-frame-bytes must be at least 1024");
@@ -98,6 +110,23 @@ public record ApplicationConfig(
             requirePositive(startupTimeoutMs, "managed-python-runtime.startup-timeout-ms");
             requirePositive(requestTimeoutMs, "managed-python-runtime.request-timeout-ms");
             requirePositive(shutdownTimeoutMs, "managed-python-runtime.shutdown-timeout-ms");
+            if (restartInitialBackoffMs < 0) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.restart-initial-backoff-ms must not be negative");
+            }
+            if (restartMaximumBackoffMs < restartInitialBackoffMs) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.restart-maximum-backoff-ms must be at least restart-initial-backoff-ms");
+            }
+            if (restartEnabled && restartMaxAttempts < 1) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.restart-max-attempts must be at least 1 when restart is enabled");
+            }
+            if (!restartEnabled && restartMaxAttempts < 0) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.restart-max-attempts must not be negative");
+            }
+            requirePositive(restartWindowMs, "managed-python-runtime.restart-window-ms");
         }
 
         public ManagedPythonRuntimeConfig normalized() {
@@ -106,11 +135,18 @@ public record ApplicationConfig(
                     pythonExecutable,
                     Path.of(applicationDirectory).toAbsolutePath().normalize().toString(),
                     Path.of(udsDirectory).toAbsolutePath().normalize().toString(),
+                    workerCount,
                     queueCapacity,
+                    queueTimeoutMs,
                     maxFrameBytes,
                     startupTimeoutMs,
                     requestTimeoutMs,
-                    shutdownTimeoutMs
+                    shutdownTimeoutMs,
+                    restartEnabled,
+                    restartInitialBackoffMs,
+                    restartMaximumBackoffMs,
+                    restartMaxAttempts,
+                    restartWindowMs
             );
         }
     }
