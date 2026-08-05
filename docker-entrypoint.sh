@@ -71,8 +71,14 @@ case "$RUN_TARGET" in
     E2E)
         java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE"
         ;;
+    E2E_SHUTDOWN_DRAIN)
+        java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE" SHUTDOWN_DRAIN
+        ;;
+    E2E_SHUTDOWN_TIMEOUT)
+        java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE" SHUTDOWN_TIMEOUT
+        ;;
     *)
-        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION or E2E." >&2
+        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION, E2E, E2E_SHUTDOWN_DRAIN, or E2E_SHUTDOWN_TIMEOUT." >&2
         exit 2
         ;;
 esac

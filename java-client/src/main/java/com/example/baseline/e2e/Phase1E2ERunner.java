@@ -19,18 +19,39 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public final class Phase1E2ERunner {
     private Phase1E2ERunner() {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 1) throw new IllegalArgumentException("Usage: Phase1E2ERunner HTTP|MANAGED_RUNTIME");
-        PythonCallMode mode = PythonCallMode.fromArguments(args);
+        if (args.length < 1 || args.length > 2) {
+            throw new IllegalArgumentException(
+                    "Usage: Phase1E2ERunner HTTP|MANAGED_RUNTIME [STANDARD|SHUTDOWN_DRAIN|SHUTDOWN_TIMEOUT]");
+        }
+        PythonCallMode mode = PythonCallMode.fromArguments(new String[]{args[0]});
         ApplicationConfig config = YamlConfigLoader.load();
+        String scenario = args.length == 1 ? "STANDARD" : args[1];
+        if (!"STANDARD".equals(scenario)) {
+            if (mode != PythonCallMode.MANAGED_RUNTIME) {
+                throw new IllegalArgumentException("Shutdown scenarios require MANAGED_RUNTIME mode");
+            }
+            if ("SHUTDOWN_DRAIN".equals(scenario)) {
+                verifyShutdownDrain(config);
+                return;
+            }
+            if ("SHUTDOWN_TIMEOUT".equals(scenario)) {
+                verifyShutdownTimeout(config);
+                return;
+            }
+            throw new IllegalArgumentException("Unsupported E2E scenario: " + scenario);
+        }
         ExecutorService callers = Executors.newFixedThreadPool(4);
         try {
             PythonCallUtil.initialize(mode, config);
@@ -47,6 +68,120 @@ public final class Phase1E2ERunner {
             PythonCallUtil.close();
         }
         verifyPostCloseRejection(config);
+    }
+
+    private static void verifyShutdownDrain(ApplicationConfig config) throws Exception {
+        ExecutorService callers = Executors.newFixedThreadPool(3);
+        try {
+            PythonCallUtil.initialize(PythonCallMode.MANAGED_RUNTIME, config);
+            RestProcessingClient client = new RestProcessingClient(config.fastApi());
+            CompletableFuture<CallResult> active = processAsync(
+                    client, new ProcessRequest("shutdown-active", "active", 1_000), callers);
+            Thread.sleep(250);
+            CompletableFuture<CallResult> queued = processAsync(
+                    client, new ProcessRequest("shutdown-queued", "queued", 100), callers);
+            Thread.sleep(100);
+
+            long shutdownStart = System.nanoTime();
+            CompletableFuture<Void> shutdown = CompletableFuture.runAsync(PythonCallUtil::close, callers);
+            Thread.sleep(50);
+            verifyCallRejectedDuringShutdown(config);
+
+            CallResult activeResult = active.get(3, TimeUnit.SECONDS);
+            require(activeResult.httpStatus() == 200, "Active request did not finish successfully during drain");
+            Throwable queuedFailure = failureFrom(queued, 3, TimeUnit.SECONDS);
+            require(messageChain(queuedFailure).contains("shutting down"),
+                    "Queued request did not receive a shutdown failure: " + queuedFailure);
+            shutdown.get(6, TimeUnit.SECONDS);
+            double shutdownMs = (System.nanoTime() - shutdownStart) / 1_000_000.0;
+            require(active.isDone() && queued.isDone() && shutdown.isDone(),
+                    "A shutdown-drain future did not reach a terminal state");
+            System.out.printf(
+                    "Phase 1 shutdown drain passed: activeCompleted=true, queuedFailed=true, " +
+                            "newCallsRejected=true, shutdownMs=%.3f%n",
+                    shutdownMs);
+        } finally {
+            PythonCallUtil.close();
+            callers.shutdownNow();
+            callers.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private static void verifyShutdownTimeout(ApplicationConfig config) throws Exception {
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            PythonCallUtil.initialize(PythonCallMode.MANAGED_RUNTIME, config);
+            RestProcessingClient client = new RestProcessingClient(config.fastApi());
+            CompletableFuture<CallResult> active = processAsync(
+                    client, new ProcessRequest("shutdown-timeout", "timeout", 10_000), caller);
+            Thread.sleep(250);
+
+            long shutdownStart = System.nanoTime();
+            PythonCallUtil.close();
+            double shutdownMs = (System.nanoTime() - shutdownStart) / 1_000_000.0;
+            Throwable activeFailure = failureFrom(active, 2, TimeUnit.SECONDS);
+            require(messageChain(activeFailure).contains("exceeded the shutdown timeout"),
+                    "Active request did not receive the deterministic shutdown-timeout failure: " + activeFailure);
+            require(shutdownMs < config.managedPythonRuntime().shutdownTimeoutMs() + 1_500,
+                    "Shutdown exceeded its bounded allowance: " + shutdownMs + " ms");
+            require(active.isDone(), "Timed-out active request future was not completed");
+            System.out.printf(
+                    "Phase 1 shutdown timeout passed: activeFailed=true, futureDone=true, shutdownMs=%.3f%n",
+                    shutdownMs);
+        } finally {
+            PythonCallUtil.close();
+            caller.shutdownNow();
+            caller.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private static CompletableFuture<CallResult> processAsync(
+            RestProcessingClient client,
+            ProcessRequest request,
+            ExecutorService executor
+    ) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return client.process(request);
+            } catch (Exception exception) {
+                throw new CompletionException(exception);
+            }
+        }, executor);
+    }
+
+    private static void verifyCallRejectedDuringShutdown(ApplicationConfig config) {
+        try {
+            PythonCallUtil.call(request(config, "{}"));
+            throw new IllegalStateException("New call was accepted after shutdown began");
+        } catch (IllegalStateException expected) {
+            require(expected.getMessage().contains("SHUTTING_DOWN") || expected.getMessage().contains("CLOSED"),
+                    "New-call rejection did not report shutdown state: " + expected.getMessage());
+        } catch (Exception exception) {
+            throw new IllegalStateException("Unexpected new-call rejection", exception);
+        }
+    }
+
+    private static Throwable failureFrom(
+            CompletableFuture<?> future,
+            long timeout,
+            TimeUnit unit
+    ) throws InterruptedException, TimeoutException {
+        try {
+            future.get(timeout, unit);
+            throw new IllegalStateException("Expected future to fail");
+        } catch (ExecutionException exception) {
+            return exception.getCause();
+        }
+    }
+
+    private static String messageChain(Throwable throwable) {
+        StringBuilder messages = new StringBuilder();
+        Throwable current = throwable;
+        while (current != null) {
+            if (current.getMessage() != null) messages.append(current.getMessage()).append(' ');
+            current = current.getCause();
+        }
+        return messages.toString();
     }
 
     private static void verifyConflictingInitialization(PythonCallMode mode, ApplicationConfig config) {

@@ -23,6 +23,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 final class ManagedPythonRuntime implements PythonCallExecutor {
     private final ManagedPythonRuntimeConfig config;
@@ -34,7 +35,10 @@ final class ManagedPythonRuntime implements PythonCallExecutor {
     private final ConcurrentHashMap<String, CompletableFuture<PythonCallResponse>> pending = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final Object outputLock = new Object();
+    private final Object dispatchStateLock = new Object();
+    private final AtomicReference<Submission> activeSubmission = new AtomicReference<>();
     private final CountDownLatch shutdownAcknowledged = new CountDownLatch(1);
+    private final CountDownLatch dispatcherStopped = new CountDownLatch(1);
     private final Thread dispatcherThread;
     private final Thread responseReaderThread;
 
@@ -112,6 +116,9 @@ final class ManagedPythonRuntime implements PythonCallExecutor {
         if (remaining <= 0 || !admissionQueue.offer(submission, remaining, TimeUnit.NANOSECONDS)) {
             throw new TimeoutException("Managed Python Runtime admission queue timed out");
         }
+        if (!running.get() && admissionQueue.remove(submission)) {
+            submission.completion.completeExceptionally(shutdownFailure());
+        }
         try {
             remaining = deadline - System.nanoTime();
             if (remaining <= 0) throw new TimeoutException("Managed Python Runtime request timed out");
@@ -132,35 +139,68 @@ final class ManagedPythonRuntime implements PythonCallExecutor {
     }
 
     private void dispatchLoop() {
-        while (running.get() || !admissionQueue.isEmpty()) {
-            Submission submission = null;
-            try {
-                submission = admissionQueue.poll(100, TimeUnit.MILLISECONDS);
-                if (submission == null || submission.completion.isDone()) continue;
-                if (System.nanoTime() >= submission.deadlineNs) {
-                    submission.completion.completeExceptionally(
-                            new TimeoutException("Managed Python Runtime request timed out in queue"));
+        Submission submission = null;
+        try {
+            while (true) {
+                synchronized (dispatchStateLock) {
+                    if (!running.get()) break;
+                    submission = admissionQueue.poll();
+                    if (submission != null) activeSubmission.set(submission);
+                }
+                if (submission == null) {
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                     continue;
                 }
-                if (pending.putIfAbsent(submission.request.requestId(), submission.completion) != null) {
+                try {
+                    if (submission.completion.isDone()) continue;
+                    if (System.nanoTime() >= submission.deadlineNs) {
+                        submission.completion.completeExceptionally(
+                                new TimeoutException("Managed Python Runtime request timed out in queue"));
+                        continue;
+                    }
+                    synchronized (dispatchStateLock) {
+                        if (!running.get()) {
+                            submission.completion.completeExceptionally(shutdownFailure());
+                            continue;
+                        }
+                        if (pending.putIfAbsent(submission.request.requestId(), submission.completion) != null) {
+                            submission.completion.completeExceptionally(new IllegalStateException(
+                                    "Duplicate pending request ID: " + submission.request.requestId()));
+                            continue;
+                        }
+                        writeRequest(submission.request);
+                        submission.transmitted = true;
+                    }
+                    long remaining = submission.deadlineNs - System.nanoTime();
+                    if (remaining <= 0) throw new TimeoutException("Managed Python Runtime request timed out");
+                    submission.completion.get(remaining, TimeUnit.NANOSECONDS);
+                } catch (InterruptedException exception) {
                     submission.completion.completeExceptionally(
-                            new IllegalStateException("Duplicate pending request ID: " + submission.request.requestId()));
-                    continue;
+                            new IllegalStateException("Managed Python Runtime dispatcher was interrupted", exception));
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (ExecutionException ignored) {
+                    // The response reader or shutdown path recorded the request-specific failure.
+                } catch (Exception exception) {
+                    submission.completion.completeExceptionally(exception);
+                } finally {
+                    pending.remove(submission.request.requestId(), submission.completion);
+                    activeSubmission.compareAndSet(submission, null);
+                    submission = null;
                 }
-                writeRequest(submission.request);
-                long remaining = submission.deadlineNs - System.nanoTime();
-                if (remaining <= 0) throw new TimeoutException("Managed Python Runtime request timed out");
-                submission.completion.get(remaining, TimeUnit.NANOSECONDS);
-            } catch (InterruptedException exception) {
-                Thread.currentThread().interrupt();
-                break;
-            } catch (ExecutionException ignored) {
-                // The response reader already recorded the request-specific failure.
-            } catch (Exception exception) {
-                if (submission != null) submission.completion.completeExceptionally(exception);
-            } finally {
-                if (submission != null) pending.remove(submission.request.requestId(), submission.completion);
             }
+        } finally {
+            if (submission != null) {
+                submission.completion.completeExceptionally(shutdownFailure());
+                pending.remove(submission.request.requestId(), submission.completion);
+                activeSubmission.compareAndSet(submission, null);
+            }
+            dispatcherStopped.countDown();
         }
     }
 
@@ -224,37 +264,75 @@ final class ManagedPythonRuntime implements PythonCallExecutor {
     @Override
     public void close() {
         if (!running.compareAndSet(true, false)) return;
-        IllegalStateException shutdownFailure = new IllegalStateException("Managed Python Runtime is shutting down");
-        Submission queued;
-        while ((queued = admissionQueue.poll()) != null) queued.completion.completeExceptionally(shutdownFailure);
-        failAll(shutdownFailure);
-        dispatcherThread.interrupt();
-        try {
-            Map<String, Object> metadata = Map.of(
-                    "protocolVersion", PythonRuntimeProtocol.VERSION,
-                    "type", "shutdown"
-            );
-            synchronized (outputLock) {
-                PythonRuntimeProtocol.writeFrame(socketChannel, metadata, new byte[0], config.maxFrameBytes());
+        long shutdownDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.shutdownTimeoutMs());
+        IllegalStateException shutdownFailure = shutdownFailure();
+        Submission active;
+        synchronized (dispatchStateLock) {
+            Submission queued;
+            while ((queued = admissionQueue.poll()) != null) {
+                queued.completion.completeExceptionally(shutdownFailure);
             }
-            shutdownAcknowledged.await(config.shutdownTimeoutMs(), TimeUnit.MILLISECONDS);
+            active = activeSubmission.get();
+            if (active != null && !active.transmitted) {
+                active.completion.completeExceptionally(shutdownFailure);
+            }
+        }
+
+        if (active != null && active.transmitted && !active.completion.isDone()) {
+            awaitActiveCompletion(active, shutdownDeadline);
+        }
+        if (active != null && !active.completion.isDone()) {
+            TimeoutException timeout = new TimeoutException(
+                    "Managed Python Runtime active request exceeded the shutdown timeout");
+            active.completion.completeExceptionally(timeout);
+            pending.remove(active.request.requestId(), active.completion);
+        }
+        failAll(shutdownFailure);
+
+        try {
+            if (remainingNanos(shutdownDeadline) > 0 && socketChannel.isOpen()) {
+                Map<String, Object> metadata = Map.of(
+                        "protocolVersion", PythonRuntimeProtocol.VERSION,
+                        "type", "shutdown"
+                );
+                synchronized (outputLock) {
+                    PythonRuntimeProtocol.writeFrame(socketChannel, metadata, new byte[0], config.maxFrameBytes());
+                }
+                long remaining = remainingNanos(shutdownDeadline);
+                if (remaining > 0) shutdownAcknowledged.await(remaining, TimeUnit.NANOSECONDS);
+            }
         } catch (Exception ignored) {
             // Process termination below is the deterministic fallback.
         } finally {
             closeQuietly(socketChannel);
-            responseReaderThread.interrupt();
-            join(dispatcherThread, config.shutdownTimeoutMs());
-            join(responseReaderThread, config.shutdownTimeoutMs());
-            stopProcess(process, config.shutdownTimeoutMs());
+            awaitLatch(dispatcherStopped, shutdownDeadline);
+            joinUntil(responseReaderThread, shutdownDeadline);
+            stopProcessUntil(process, shutdownDeadline);
             deleteRuntimeFiles(socketPath, runtimeDirectory);
             System.out.printf("Managed Python Runtime stopped: workerPid=%d, socketRemoved=%s%n",
                     process.pid(), !Files.exists(socketPath));
         }
     }
 
+    private static void awaitActiveCompletion(Submission active, long shutdownDeadline) {
+        long remaining = remainingNanos(shutdownDeadline);
+        if (remaining <= 0) return;
+        try {
+            active.completion.get(remaining, TimeUnit.NANOSECONDS);
+        } catch (ExecutionException | TimeoutException ignored) {
+            // Completion state is inspected by close() after the drain opportunity.
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private void failAll(Exception exception) {
         pending.forEach((requestId, completion) -> completion.completeExceptionally(exception));
         pending.clear();
+    }
+
+    private static IllegalStateException shutdownFailure() {
+        return new IllegalStateException("Managed Python Runtime is shutting down");
     }
 
     private static SocketChannel connect(Path socketPath, Process process, long deadline) throws Exception {
@@ -336,6 +414,21 @@ final class ManagedPythonRuntime implements PythonCallExecutor {
         }
     }
 
+    private static void stopProcessUntil(Process process, long deadlineNs) {
+        if (process == null || !process.isAlive()) return;
+        try {
+            long remaining = remainingNanos(deadlineNs);
+            if (remaining > 0 && process.waitFor(remaining, TimeUnit.NANOSECONDS)) return;
+            process.destroy();
+            remaining = remainingNanos(deadlineNs);
+            if (remaining > 0 && process.waitFor(remaining, TimeUnit.NANOSECONDS)) return;
+            process.destroyForcibly();
+        } catch (InterruptedException exception) {
+            process.destroyForcibly();
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private static void deleteRuntimeFiles(Path socketPath, Path runtimeDirectory) {
         try {
             Files.deleteIfExists(socketPath);
@@ -353,18 +446,33 @@ final class ManagedPythonRuntime implements PythonCallExecutor {
         }
     }
 
-    private static void join(Thread thread, long timeoutMs) {
+    private static void joinUntil(Thread thread, long deadlineNs) {
         try {
-            thread.join(timeoutMs);
+            long remaining = remainingNanos(deadlineNs);
+            if (remaining > 0) TimeUnit.NANOSECONDS.timedJoin(thread, remaining);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private static void awaitLatch(CountDownLatch latch, long deadlineNs) {
+        try {
+            long remaining = remainingNanos(deadlineNs);
+            if (remaining > 0) latch.await(remaining, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static long remainingNanos(long deadlineNs) {
+        return Math.max(0, deadlineNs - System.nanoTime());
     }
 
     private static final class Submission {
         private final PythonCallRequest request;
         private final long deadlineNs;
         private final CompletableFuture<PythonCallResponse> completion = new CompletableFuture<>();
+        private volatile boolean transmitted;
 
         private Submission(PythonCallRequest request, long deadlineNs) {
             this.request = request;

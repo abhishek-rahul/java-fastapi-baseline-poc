@@ -23,6 +23,7 @@ Environment: Windows 10 host; Java 21.0.9; Maven 3.9.10; Python 3.13.5 host; Doc
 - Added a separate real-boundary `Phase1E2ERunner`; no diagnostic branch was added to `BaselineApplication`.
 - Updated the container entrypoint so HTTP starts Uvicorn and managed mode does not.
 - Kept existing tests and adapted their setup to the new global utility boundary; no tests were added.
+- Corrected the Phase 1 shutdown race: queued calls fail immediately, one transmitted active call gets the configured drain window, timeout failure is deterministic, and dispatcher ownership cannot abandon a dequeued future.
 
 ## Files changed
 
@@ -84,6 +85,27 @@ Environment: Windows 10 host; Java 21.0.9; Maven 3.9.10; Python 3.13.5 host; Doc
 - PASS — three repeated start/stop runs reported socket removal and left no Phase 1 container or worker process.
 - PASS — switching back to HTTP required only the mode argument.
 - PASS — `python-fastapi/app/main.py` and `python-fastapi/app/models.py` are unchanged.
+
+## Shutdown race fix evidence
+
+- `cd java-client; mvn -DskipTests clean package`
+  Result: PASS - 17 main sources and 3 existing test sources compiled; the shaded JAR was built.
+- `cd java-client; mvn test`
+  Result: PASS - 8 existing tests, 0 failures, 0 errors, 0 skipped.
+- `docker build -t java-fastapi-runtime-poc .`
+  Result: PASS - the image containing the focused shutdown fix and E2E scenarios built successfully.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E_SHUTDOWN_DRAIN`
+  Result: PASS - the transmitted 1,000 ms request completed normally, the queued request failed, new calls were rejected, all futures completed, shutdown took 742.800 ms, and `socketRemoved=true` was reported for worker PID 27.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E_SHUTDOWN_TIMEOUT`
+  Result: PASS - the transmitted 10,000 ms request exceeded the 5,000 ms shutdown window, its caller received the deterministic shutdown-timeout failure, its future was done, shutdown returned in 5,003.719 ms, and `socketRemoved=true` was reported for worker PID 27.
+- Post-fix `docker run --rm java-fastapi-runtime-poc HTTP E2E` and `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E`
+  Result: PASS - both complete standard E2E harnesses passed without regression.
+- Post-fix `docker run --rm java-fastapi-runtime-poc HTTP` and `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME`
+  Result: PASS - both modes completed 1,000/1,000 requests; HTTP batch 3,257.634 ms and managed batch 11,798.846 ms; managed shutdown reported `socketRemoved=true`.
+- Post-fix `docker ps -a --filter ancestor=java-fastapi-runtime-poc --format '{{.ID}} {{.Status}} {{.Names}}'`
+  Result: PASS - no containers or managed workers remained.
+- PASS - shutdown drain allows the transmitted active request to complete while rejecting new calls and failing queued calls, with every caller future terminal.
+- PASS - an active request beyond the shutdown deadline fails deterministically, shutdown remains bounded, and worker/UDS cleanup completes.
 
 ## Known limitations
 
