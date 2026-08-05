@@ -453,13 +453,19 @@ public final class Phase2E2ERunner {
     }
 
     private static Set<Long> waitForChangedPool(Set<Long> before, int count, long timeoutMs) throws Exception {
-        waitUntil(() -> workerPids().size() == count && !workerPids().equals(before), timeoutMs,
+        waitUntil(() -> workerPids().size() == count && !workerPids().equals(before)
+                        && PythonCallUtil.managedRuntimeSnapshot()
+                        .map(snapshot -> snapshot.fullyReady() && snapshot.responsiveWorkers() == count)
+                        .orElse(false), timeoutMs,
                 "Worker pool PID set did not change from " + before + "; observed " + workerPids());
         return workerPids();
     }
 
     private static long waitForNewPid(Set<Long> seen, long timeoutMs) throws Exception {
-        waitUntil(() -> workerPids().stream().anyMatch(pid -> !seen.contains(pid)), timeoutMs,
+        waitUntil(() -> workerPids().stream().anyMatch(pid -> !seen.contains(pid))
+                        && PythonCallUtil.managedRuntimeSnapshot()
+                        .map(snapshot -> snapshot.ready() && snapshot.responsiveWorkers() == 1)
+                        .orElse(false), timeoutMs,
                 "A replacement worker did not appear; seen=" + seen + ", current=" + workerPids());
         return workerPids().stream().filter(pid -> !seen.contains(pid)).findFirst().orElseThrow();
     }

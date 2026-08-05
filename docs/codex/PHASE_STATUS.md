@@ -412,3 +412,142 @@ Date: 2026-08-06
 ### Focused acceptance result
 
 PASS - `CAPACITY_EXCEEDED` now fails the affected request and all sibling assignments exactly once, removes all generation capacity, terminates and cleans the mismatched worker, and restores capacity through the existing restart policy. Normal `ASGI_EXECUTION_FAILED` behavior remains request-specific. No Phase 4 work was started.
+
+---
+
+# Phase 4 - Production Operations Hardening
+
+State: COMPLETE
+Date: 2026-08-06
+Environment: Windows 10 host with Docker Desktop Linux containers; final image uses Java 17 and Python 3.12
+
+## Implemented
+
+- Added idle-only, bounded PING/PONG health monitoring over each worker's existing UDS connection. One shared scheduler and one outstanding check per current generation detect a stuck idle event loop without consuming business capacity or creating per-check threads.
+- Added explicit process-alive, responsive, dispatch-eligible, ready, fully-ready, degraded, saturated, exhausted, and unavailable semantics through `PythonCallUtil.managedRuntimeSnapshot()` and immutable bounded snapshots.
+- Added atomic bounded counters/timers, stable failure categories, one bounded last-failure summary, and SLF4J `key=value` lifecycle/health/restart/timeout/shutdown events.
+- Replaced inherited worker output with one always-draining, worker-identified, chunk- and rate-bounded combined output reader per process.
+- Hardened configuration ranges, overflow checks, UDS path length, normalized path ownership, executable/application validation, POSIX private runtime permissions, shared startup deadlines, readiness cleanup, initialization cancellation, JVM shutdown, worker thread joins, and common-deadline resource cleanup.
+- Added direct tini-to-Java signal forwarding for managed containers, the real `Phase4E2ERunner`, Phase 4 container routing, and the Managed Python Runtime operations runbook.
+- Updated the Phase 2 replacement E2E wait to use the authoritative Phase 4 readiness snapshot instead of treating OS process appearance as readiness. No production failure-injection hook or new unit test was added.
+
+## Files changed
+
+- `java-client/src/main/java/com/example/baseline/utils/python/PythonCallUtil.java`
+- `java-client/src/main/java/com/example/baseline/utils/python/ManagedPythonRuntime.java`
+- `java-client/src/main/java/com/example/baseline/utils/python/ManagedPythonWorker.java`
+- `java-client/src/main/java/com/example/baseline/utils/python/PythonRuntimeProtocol.java`
+- `java-client/src/main/java/com/example/baseline/utils/python/ManagedPythonRuntimeSnapshot.java`
+- `java-client/src/main/java/com/example/baseline/utils/python/ManagedPythonFailureCategory.java`
+- `java-client/src/main/java/com/example/baseline/utils/config/ApplicationConfig.java`
+- `java-client/src/main/resources/application.yml`
+- `python-fastapi/python_runtime/worker_runtime.py`
+- `java-client/src/main/java/com/example/baseline/e2e/Phase2E2ERunner.java`
+- `java-client/src/main/java/com/example/baseline/e2e/Phase4E2ERunner.java`
+- `java-client/src/main/java/com/example/baseline/BaselineApplication.java`
+- `docker-entrypoint.sh`
+- `README.md`
+- `docs/codex/OPERATIONS_RUNBOOK.md`
+- `docs/codex/PHASE_STATUS.md`
+
+## Commands and observed results
+
+- `cd java-client; mvn -DskipTests clean package`
+  Result: PASS - 23 main sources and 3 existing test sources compiled for Java 17; the shaded JAR was built; total time 10.301 seconds.
+- `cd java-client; mvn test`
+  Result: PASS - 8 existing tests, 0 failures, 0 errors, 0 skipped; total time 6.555 seconds.
+- `docker build --no-cache -t java-fastapi-runtime-poc .`
+  Result: PASS - the final source built without cache with exit code 0 in 91.9 seconds.
+- `docker run --rm java-fastapi-runtime-poc HTTP` and `docker run --rm java-fastapi-runtime-poc HTTP E2E`
+  Result: PASS - real OkHttp/Uvicorn completed 1,000/1,000 workload requests in 5,157.796 ms and the existing HTTP lifecycle, headers, validation/non-2xx, and concurrent-caller E2E passed. The final no-cache image HTTP E2E was rerun successfully.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME` and `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E`
+  Result: PASS - four Java-owned CPython workers completed 1,000/1,000 requests in 4,950.181 ms without Uvicorn, followed by the managed lifecycle, validation/non-2xx, and concurrent-caller E2E. The final no-cache image managed E2E was rerun successfully.
+- Phase 2 matrix: `PARALLEL`, `QUEUE`, `IDLE_FAILURE`, `BUSY_FAILURE`, `STARTUP_FAILURE`, `RESTART_EXHAUSTION`, `REQUEST_TIMEOUT`, `UNHEALTHY_FORCE_TERMINATION`, `SHUTDOWN`, and `SHUTDOWN_TIMEOUT`
+  Result: PASS - all ten real-process scenarios passed. Observations included four-process overlap in 1,191.752 ms; five bounded queue failures with all futures terminal; idle PID 33 replaced by ready PID 64; one non-retried busy failure; bounded zero-child startup failure in 100 ms; bounded exhaustion after three generations; timeout replacement PID 27 to PID 42; forced suspended-worker termination in 930 ms; graceful drain in 744 ms; and forced common-deadline shutdown in 566 ms against a 500 ms deadline.
+- Phase 3 matrix: `SAME_WORKER`, `MULTI_WORKER`, `OUT_OF_ORDER`, `CAPACITY`, `MULTI_ACTIVE_FAILURE`, `MULTI_ACTIVE_TIMEOUT`, `CORRELATED_ERROR`, `CAPACITY_MISMATCH`, `SHUTDOWN`, and `SHUTDOWN_TIMEOUT`
+  Result: PASS - all ten scenarios passed. One PID overlapped four requests in 612.467 ms; two PIDs overlapped six in 550.413 ms; completion order was `[order-1, order-3, order-2, order-0]` with correct mappings; bounded capacity produced four terminal failures; worker death failed three assignments without retry; transmitted timeout failed three siblings and replaced the PID; correlated ASGI error affected one request only; genuine capacity mismatch poisoned/replaced the worker; graceful shutdown drained six active tasks in 379 ms; forced shutdown terminalized six futures in 541 ms against one 500 ms deadline.
+- `MANAGED_RUNTIME PHASE4_E2E IDLE_HEALTH`
+  Result: PASS - one PID completed three PING/PONG cycles; `healthSent=3`, `healthSucceeded=3`, business in-flight remained zero, available capacity remained two, and a later business request succeeded. The scenario passed again against the final no-cache image.
+- `MANAGED_RUNTIME PHASE4_E2E STUCK_IDLE`
+  Result: PASS - real PID 27 was suspended with `SIGSTOP`, one health timeout detected it without a business request, forced termination removed it, PID 44 became ready, and subsequent work succeeded. The scenario passed against the final no-cache image.
+- `STALE_PONG` and `BUSY_HEALTH_POLICY`
+  Result: PASS - an old-generation PONG did not change capacity/publication; the correct response completed health. No PING was sent during a valid 900 ms active request, health resumed after idle, and the PID remained stable.
+- `DEGRADED_VISIBILITY`, `RESTART_EXHAUSTION_VISIBILITY`, and `PARTIAL_STARTUP`
+  Result: PASS - killing one of two PIDs exposed `DEGRADED`, healthy service continued, and replacement restored full readiness; one-slot restart exhaustion exposed `UNAVAILABLE` without an infinite loop; controlled partial startup succeeded degraded and restored two ready PIDs with one bounded restart. Partial startup passed again against the final image.
+- `HEALTH_SHUTDOWN_RACE` and `SNAPSHOT_METRICS`
+  Result: PASS - shutdown with an outstanding delayed health response completed in 1,018 ms with no managed thread remaining; metrics exposed admitted/completed, queue/request timers, health success, worker restart, and bounded `SOCKET_EOF` last-failure context.
+- `RESOURCE_REPETITION`
+  Result: PASS - three real worker-kill/replacement cycles observed four generations, three restarts, successful requests after every recovery, and clean final process/socket/directory shutdown.
+- `MANAGED_RUNTIME PHASE4_E2E SOAK`
+  Result: PASS - two observed 5,100-request runs completed with stable four-PID sets, zero pending queue/in-flight work after batches, and clean shutdown. Final-image evidence: all worker FD counts remained exactly 8; per-worker RSS remained unchanged at 42,836-42,932 KiB.
+- Detached `PARENT_TERMINATION` containers followed by `docker kill --signal=TERM` and `docker kill --signal=KILL`
+  Result: PASS - `docker top` showed `tini -> Java -> two CPython workers`; SIGTERM removed the container/process namespace in 1,467 ms through the JVM hook, and SIGKILL removed it in 1,316 ms through Docker container teardown.
+- Final cleanup and source audit using `docker ps`, `git diff --name-only`, `git diff --check`, and `rg`
+  Result: PASS - no test container remained; FastAPI `app/main.py`, `app/models.py`, `asgi_adapter.py`, `HttpUtil`, and `RestProcessingClient` had no diff; no CPU/I/O split, GIL manipulation, automatic business retry, unbounded health executor, or request-body logging was introduced.
+
+## Acceptance gates
+
+- PASS - clean Java package and all eight existing tests succeed; no unit tests were added.
+- PASS - existing HTTP/OkHttp/Uvicorn and managed UDS/ASGI modes both pass and rollback remains the `HTTP` argument only.
+- PASS - idle event-loop responsiveness is monitored through bounded generation-correlated PING/PONG without business-capacity consumption or per-check threads.
+- PASS - busy workers are not health-checked, avoiding false failures during CPU-heavy or delayed active execution.
+- PASS - stale health responses cannot revive or republish an old generation; one outstanding health record is enforced per worker.
+- PASS - snapshots, bounded metrics, typed failures, structured logs, and worker-identified bounded output provide operational evidence without payload exposure.
+- PASS - all/partial/zero-worker startup, degraded recovery, restart exhaustion, crash, timeout, saturation, and capacity mismatch remain bounded and observable.
+- PASS - health scheduling stops before drain; no replacement begins during close; every future is terminal; one shared deadline governs shutdown and thread/process/socket cleanup.
+- PASS - soak, repetition, SIGTERM, and SIGKILL container tests leave no CPython descendant, UDS socket, runtime directory, managed thread, or container.
+- PASS - FastAPI business application, ASGI adapter, HTTP utility, REST client, CPython GIL behavior, and unified request path remain unchanged.
+
+## Remaining limitations
+
+- Worker count and per-worker in-flight capacity remain fixed configuration; autoscaling is not implemented.
+- Health checks intentionally cover idle workers only. Active CPU-heavy or stuck requests are detected by their existing request deadline.
+- A transmitted timeout or ambiguous transport failure poisons the full worker generation and fails siblings without retry.
+- Snapshots and metrics are in-process diagnostics; no Prometheus, JMX, OpenTelemetry, or external health server was added.
+- `SIGKILL` cannot execute JVM cleanup; orphan prevention for that signal relies on the documented Docker/tini container process namespace.
+- Managed UDS E2E was executed in Linux containers rather than on the Windows host.
+- The unchanged FastAPI/Pydantic combination continues to emit existing alias warnings.
+
+## Final statement
+
+Phase 4 complete
+
+---
+
+## Focused Phase 4 health and shutdown deadline corrections
+
+Date: 2026-08-06
+
+- PONG timeout ownership now begins only after the complete PING frame has been written to the worker UDS. A queued health item has no response deadline.
+- An already-transmitted PING remains timeout-eligible even when business work is assigned afterward. The idle requirement applies only when creating a new health check.
+- Pool shutdown now reserves a bounded tail of its single absolute deadline for forced process termination and thread/output joins. Worker cleanup no longer creates a separate 250 ms join deadline, and forced termination is reported exactly once per generation.
+- Added the real-process `HEALTH_TIMEOUT_WITH_ACTIVE` Phase 4 scenario; no production failure-injection hook or unit test was added.
+
+### Commands and observed results
+
+- `cd java-client; mvn -DskipTests clean package`
+  Result: PASS - 23 main sources and 3 existing test sources compiled; shaded JAR built; final total time 9.161 seconds.
+- `cd java-client; mvn test`
+  Result: PASS - 8 existing tests, 0 failures, 0 errors, 0 skipped; final total time 4.699 seconds.
+- `docker build -t java-fastapi-runtime-poc .`
+  Result: PASS - final focused source image built successfully with exit code 0.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE4_E2E HEALTH_TIMEOUT_WITH_ACTIVE`
+  Result: PASS - PING was transmitted before business assignment; the delayed PONG timed out while one business request was active, that future became terminal, PID 27 was removed, replacement PID 43 became ready and served subsequent work, and final cleanup reported `cleanupFailures=0`.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE4_E2E IDLE_HEALTH` and `BUSY_HEALTH_POLICY`
+  Result: PASS - three normal PING/PONG cycles succeeded without consuming business capacity; no new PING was created during active work and health resumed after idle.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE4_E2E HEALTH_SHUTDOWN_RACE`
+  Result: PASS - shutdown with an outstanding delayed health response completed in 998 ms with no remaining managed thread, worker process, socket, or runtime directory.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E SHUTDOWN`
+  Result: PASS - six active requests drained, four queued requests failed, new calls were rejected, all futures became terminal, and both worker PIDs were removed in 372 ms.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E SHUTDOWN_TIMEOUT`
+  Result: PASS - three consecutive final-image runs made all six active futures terminal in 279, 280, and 272 ms against one 500 ms deadline. Every run reported two forced terminations, zero cleanup failures, and removal of both PIDs and owned UDS resources.
+- `docker run --rm java-fastapi-runtime-poc HTTP E2E`
+  Result: PASS - unchanged OkHttp/Uvicorn lifecycle, validation/non-2xx, and concurrent-caller behavior passed.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E`
+  Result: PASS - four real Java-owned CPython workers passed the standard UDS/ASGI lifecycle and concurrent-caller regression; shutdown reported zero cleanup failures.
+- `docker ps -a --filter ancestor=java-fastapi-runtime-poc --format "{{.ID}} {{.Status}} {{.Names}}"`
+  Result: PASS - output was empty; no test container remained.
+
+### Focused acceptance result
+
+PASS - PONG timing is transmission-based, later business activity cannot suppress an outstanding health timeout, and all forced-cleanup waits use the one pool shutdown deadline. HTTP and FastAPI application code remain unchanged.

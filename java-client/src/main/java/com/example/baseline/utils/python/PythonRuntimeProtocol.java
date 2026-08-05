@@ -12,6 +12,14 @@ import java.util.Map;
 
 final class PythonRuntimeProtocol {
     static final int VERSION = 1;
+    static final String TYPE_READY = "ready";
+    static final String TYPE_REQUEST = "request";
+    static final String TYPE_RESPONSE = "response";
+    static final String TYPE_ERROR = "error";
+    static final String TYPE_PING = "ping";
+    static final String TYPE_PONG = "pong";
+    static final String TYPE_SHUTDOWN = "shutdown";
+    static final String TYPE_SHUTDOWN_ACK = "shutdown_ack";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() { };
 

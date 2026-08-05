@@ -4,7 +4,9 @@ import com.example.baseline.utils.config.ApplicationConfig.ManagedPythonRuntimeC
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.SocketChannel;
@@ -18,10 +20,12 @@ import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 final class ManagedPythonWorker {
     private static final Logger LOGGER = LoggerFactory.getLogger(ManagedPythonWorker.class);
@@ -29,16 +33,51 @@ final class ManagedPythonWorker {
     private static final String ASGI_EXECUTION_FAILED = "ASGI_EXECUTION_FAILED";
     private static final String CAPACITY_EXCEEDED = "CAPACITY_EXCEEDED";
 
+    static final class StartupException extends IOException {
+        private final ManagedPythonFailureCategory category;
+
+        private StartupException(
+                ManagedPythonFailureCategory category, String message, Throwable cause) {
+            super(message, cause);
+            this.category = category;
+        }
+
+        ManagedPythonFailureCategory category() {
+            return category;
+        }
+    }
+
     interface Listener {
         void onCapacityAvailable(ManagedPythonWorker worker);
 
-        void onUnhealthy(ManagedPythonWorker worker, Exception failure);
+        void onUnhealthy(
+                ManagedPythonWorker worker,
+                ManagedPythonFailureCategory category,
+                Exception failure);
+
+        void onRequestTerminal(
+                ManagedPythonWorker worker,
+                Assignment assignment,
+                boolean successful,
+                ManagedPythonFailureCategory category);
+
+        void onHealthCheckSent(ManagedPythonWorker worker, String healthCheckId);
+
+        void onHealthCheckSucceeded(ManagedPythonWorker worker, String healthCheckId, long latencyNanos);
+
+        void onForcedTermination(ManagedPythonWorker worker);
+
+        void onCleanupFailure(ManagedPythonWorker worker, String message, Exception failure);
     }
 
-    static final class Assignment {
+    private interface OutboundItem {
+    }
+
+    static final class Assignment implements OutboundItem {
         private final PythonCallRequest request;
         private final CompletableFuture<PythonCallResponse> completion;
         private long requestDeadlineNs;
+        private long assignedAtNs;
         private AssignmentState state = AssignmentState.QUEUED;
 
         Assignment(PythonCallRequest request, CompletableFuture<PythonCallResponse> completion) {
@@ -53,6 +92,25 @@ final class ManagedPythonWorker {
         CompletableFuture<PythonCallResponse> completion() {
             return completion;
         }
+
+        long assignedAtNs() {
+            return assignedAtNs;
+        }
+    }
+
+    private record HealthPing(String healthCheckId, int generation, long workerPid) implements OutboundItem {
+    }
+
+    private record OutstandingHealth(
+            String healthCheckId,
+            HealthTransmissionState transmissionState,
+            long transmittedAtNs,
+            long deadlineNs) {
+    }
+
+    private enum HealthTransmissionState {
+        QUEUED,
+        TRANSMITTED
     }
 
     private enum WorkerState {
@@ -76,20 +134,29 @@ final class ManagedPythonWorker {
     private final Process process;
     private final long workerPid;
     private final SocketChannel channel;
+    private final ProcessOutputCapture outputCapture;
     private final Listener listener;
     private final Object stateLock = new Object();
-    private final ArrayBlockingQueue<Assignment> outboundQueue;
+    private final ArrayBlockingQueue<OutboundItem> outboundQueue;
     private final Map<String, Assignment> activeAssignments = new HashMap<>();
     private final AtomicBoolean failurePublished = new AtomicBoolean();
     private final AtomicBoolean cleanupStarted = new AtomicBoolean();
+    private final AtomicBoolean forcedTerminationPublished = new AtomicBoolean();
     private final CountDownLatch shutdownAcknowledged = new CountDownLatch(1);
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final Thread writerThread;
     private final Thread responseReader;
+    private final long startedAtNs = System.nanoTime();
+    private final AtomicLong healthSequence = new AtomicLong();
     private volatile WorkerState state = WorkerState.RUNNING;
     private volatile long shutdownDeadlineNs = Long.MAX_VALUE;
+    private volatile long cleanupDeadlineNs = Long.MAX_VALUE;
     private int inFlightCount;
     private boolean availabilityPublished;
+    private OutstandingHealth outstandingHealth;
+    private long lastResponsiveNs = System.nanoTime();
+    private long lastResponsiveEpochMillis = System.currentTimeMillis();
+    private long lastHealthLatencyNanos;
 
     private ManagedPythonWorker(
             ManagedPythonRuntimeConfig config,
@@ -98,6 +165,7 @@ final class ManagedPythonWorker {
             Path socketPath,
             Process process,
             SocketChannel channel,
+            ProcessOutputCapture outputCapture,
             Listener listener) {
         this.config = config;
         this.workerId = workerId;
@@ -106,8 +174,9 @@ final class ManagedPythonWorker {
         this.process = process;
         this.workerPid = process.pid();
         this.channel = channel;
+        this.outputCapture = outputCapture;
         this.listener = listener;
-        this.outboundQueue = new ArrayBlockingQueue<>(config.maxInFlightPerWorker(), true);
+        this.outboundQueue = new ArrayBlockingQueue<>(config.maxInFlightPerWorker() + 1, true);
         this.writerThread = new Thread(this::writerLoop,
                 "managed-python-writer-" + workerId + "-g" + generation);
         this.responseReader = new Thread(this::responseLoop,
@@ -121,11 +190,13 @@ final class ManagedPythonWorker {
             Path runtimeDirectory,
             String workerId,
             int generation,
-            Listener listener) throws Exception {
+            Listener listener,
+            long startupDeadlineNs) throws Exception {
         Path applicationDirectory = Path.of(config.applicationDirectory());
         Path socketPath = runtimeDirectory.resolve(workerId + "-g" + generation + ".sock");
         Process process = null;
         SocketChannel channel = null;
+        ProcessOutputCapture outputCapture = null;
         try {
             process = new ProcessBuilder(
                     config.pythonExecutable(),
@@ -138,32 +209,52 @@ final class ManagedPythonWorker {
                     "--max-in-flight-per-worker",
                     Integer.toString(config.maxInFlightPerWorker()))
                     .directory(applicationDirectory.toFile())
-                    .inheritIO()
+                    .redirectErrorStream(true)
                     .start();
+            outputCapture = new ProcessOutputCapture(
+                    process.getInputStream(), workerId, generation, process.pid());
+            outputCapture.start();
 
-            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.startupTimeoutMs());
-            channel = connect(socketPath, process, deadline);
-            PythonRuntimeProtocol.Frame ready = readStartupFrame(channel, config.maxFrameBytes(), deadline);
-            if (!"ready".equals(ready.type())) {
-                throw new IOException("Expected ready message, received: " + ready.type());
+            channel = connect(socketPath, process, startupDeadlineNs);
+            PythonRuntimeProtocol.Frame ready;
+            try {
+                ready = readStartupFrame(channel, config.maxFrameBytes(), startupDeadlineNs);
+            } catch (TimeoutException timeout) {
+                throw new StartupException(ManagedPythonFailureCategory.STARTUP_TIMEOUT,
+                        "Python worker readiness timed out", timeout);
+            } catch (IOException malformed) {
+                throw new StartupException(ManagedPythonFailureCategory.READINESS_MALFORMED,
+                        "Python worker readiness frame was malformed", malformed);
+            }
+            if (!PythonRuntimeProtocol.TYPE_READY.equals(ready.type())) {
+                throw new StartupException(ManagedPythonFailureCategory.READINESS_MALFORMED,
+                        "Expected ready message, received: " + ready.type(), null);
             }
             Object reportedPid = ready.metadata().get("workerPid");
             if (!(reportedPid instanceof Number number) || number.longValue() != process.pid()) {
-                throw new IOException("Python worker readiness PID did not match the launched process");
+                throw new StartupException(ManagedPythonFailureCategory.READINESS_MALFORMED,
+                        "Python worker readiness PID did not match the launched process", null);
             }
             Object reportedCapacity = ready.metadata().get("maxInFlightPerWorker");
             if (!(reportedCapacity instanceof Number capacityNumber)
                     || capacityNumber.intValue() != config.maxInFlightPerWorker()) {
-                throw new IOException("Python worker readiness capacity did not match the configured capacity");
+                throw new StartupException(ManagedPythonFailureCategory.READINESS_CAPACITY_MISMATCH,
+                        "Python worker readiness capacity did not match the configured capacity", null);
+            }
+            if (config.healthCheckEnabled()
+                    && !Boolean.TRUE.equals(ready.metadata().get("healthCheckSupported"))) {
+                throw new StartupException(ManagedPythonFailureCategory.READINESS_MALFORMED,
+                        "Python worker readiness did not confirm health-check support", null);
             }
             ManagedPythonWorker worker = new ManagedPythonWorker(
-                    config, workerId, generation, socketPath, process, channel, listener);
-            LOGGER.debug("managedPythonEvent=ready workerId={} generation={} pid={} maxInFlight={}",
+                    config, workerId, generation, socketPath, process, channel, outputCapture, listener);
+            LOGGER.info("event=managed_python_worker_ready workerId={} generation={} pid={} maxInFlight={}",
                     workerId, generation, process.pid(), config.maxInFlightPerWorker());
             return worker;
         } catch (Exception failure) {
             closeQuietly(channel);
-            stopProcess(process, config.shutdownTimeoutMs());
+            stopProcess(process, startupDeadlineNs);
+            if (outputCapture != null) outputCapture.join(startupDeadlineNs);
             deleteSocket(socketPath);
             throw failure;
         }
@@ -187,6 +278,102 @@ final class ManagedPythonWorker {
 
     boolean isRunning() {
         return state == WorkerState.RUNNING;
+    }
+
+    boolean isResponsive() {
+        synchronized (stateLock) {
+            if (state != WorkerState.RUNNING) return false;
+            if (inFlightCount > 0) return true;
+            long allowedIdleNs = TimeUnit.MILLISECONDS.toNanos(
+                    config.healthCheckIntervalMs() + config.healthCheckTimeoutMs());
+            return !config.healthCheckEnabled()
+                    || outstandingHealth != null
+                    || System.nanoTime() - lastResponsiveNs <= allowedIdleNs;
+        }
+    }
+
+    int inFlightCount() {
+        synchronized (stateLock) {
+            return inFlightCount;
+        }
+    }
+
+    int availableCapacity() {
+        synchronized (stateLock) {
+            return state == WorkerState.RUNNING
+                    ? Math.max(0, config.maxInFlightPerWorker() - inFlightCount)
+                    : 0;
+        }
+    }
+
+    ManagedPythonRuntimeSnapshot.Worker snapshot(boolean restarting, boolean exhausted) {
+        synchronized (stateLock) {
+            boolean responsive = state == WorkerState.RUNNING && (inFlightCount > 0
+                    || !config.healthCheckEnabled()
+                    || outstandingHealth != null
+                    || System.nanoTime() - lastResponsiveNs <= TimeUnit.MILLISECONDS.toNanos(
+                    config.healthCheckIntervalMs() + config.healthCheckTimeoutMs()));
+            return new ManagedPythonRuntimeSnapshot.Worker(
+                    workerId,
+                    generation,
+                    workerPid,
+                    state.name(),
+                    process.isAlive(),
+                    responsive,
+                    responsive && inFlightCount < config.maxInFlightPerWorker(),
+                    inFlightCount,
+                    config.maxInFlightPerWorker(),
+                    outstandingHealth != null,
+                    lastResponsiveEpochMillis,
+                    lastHealthLatencyNanos,
+                    restarting,
+                    exhausted);
+        }
+    }
+
+    void healthSweep(long nowNs) {
+        if (!config.healthCheckEnabled()) return;
+        OutstandingHealth timedOut = null;
+        HealthPing ping = null;
+        synchronized (stateLock) {
+            if (state != WorkerState.RUNNING) return;
+            if (outstandingHealth != null) {
+                if (outstandingHealth.transmissionState() == HealthTransmissionState.TRANSMITTED
+                        && nowNs >= outstandingHealth.deadlineNs()) {
+                    timedOut = outstandingHealth;
+                    outstandingHealth = null;
+                }
+            } else if (inFlightCount == 0
+                    && nowNs - startedAtNs >= TimeUnit.MILLISECONDS.toNanos(
+                    config.healthCheckStartupGraceMs())
+                    && nowNs - lastResponsiveNs >= TimeUnit.MILLISECONDS.toNanos(
+                    config.healthCheckIntervalMs())) {
+                String id = workerId + "-g" + generation + "-h" + healthSequence.incrementAndGet();
+                outstandingHealth = new OutstandingHealth(
+                        id, HealthTransmissionState.QUEUED, 0, Long.MAX_VALUE);
+                ping = new HealthPing(id, generation, workerPid);
+            }
+        }
+        if (timedOut != null) {
+            TimeoutException failure = new TimeoutException(
+                    "Managed Python worker health check timed out: workerId=" + workerId
+                            + ", generation=" + generation + ", pid=" + workerPid
+                            + ", healthCheckId=" + timedOut.healthCheckId());
+            markUnhealthy(ManagedPythonFailureCategory.HEALTH_CHECK_TIMEOUT, failure);
+            return;
+        }
+        if (ping != null) {
+            if (!outboundQueue.offer(ping)) {
+                synchronized (stateLock) {
+                    if (outstandingHealth != null
+                            && outstandingHealth.healthCheckId().equals(ping.healthCheckId())) {
+                        outstandingHealth = null;
+                    }
+                }
+                markUnhealthy(ManagedPythonFailureCategory.HEALTH_CHECK_PROTOCOL_FAILURE,
+                        new IOException("Managed Python worker health queue rejected control capacity"));
+            }
+        }
     }
 
     boolean tryMarkAvailabilityPublished() {
@@ -231,6 +418,7 @@ final class ManagedPythonWorker {
             }
             assignment.requestDeadlineNs = System.nanoTime()
                     + TimeUnit.MILLISECONDS.toNanos(config.requestTimeoutMs());
+            assignment.assignedAtNs = System.nanoTime();
             activeAssignments.put(assignment.request().requestId(), assignment);
             inFlightCount++;
             reservedCount = inFlightCount;
@@ -244,10 +432,10 @@ final class ManagedPythonWorker {
         }
         if (invariantFailure != null) {
             assignment.completion().completeExceptionally(invariantFailure);
-            markUnhealthy(invariantFailure);
+            markUnhealthy(ManagedPythonFailureCategory.CAPACITY_MISMATCH, invariantFailure);
             return false;
         }
-        LOGGER.debug("managedPythonEvent=assigned workerId={} generation={} pid={} requestId={} inFlight={} maxInFlight={} timeNs={}",
+        LOGGER.debug("event=managed_python_request_assigned workerId={} generation={} pid={} requestId={} inFlight={} maxInFlight={} timeNs={}",
                 workerId, generation, workerPid, assignment.request().requestId(), reservedCount,
                 config.maxInFlightPerWorker(), System.nanoTime());
         return true;
@@ -256,10 +444,12 @@ final class ManagedPythonWorker {
     void beginDrain(long deadlineNs) {
         synchronized (stateLock) {
             if (state == WorkerState.STOPPED || state == WorkerState.UNHEALTHY) return;
-            shutdownDeadlineNs = deadlineNs;
+            shutdownDeadlineNs = Math.min(shutdownDeadlineNs, deadlineNs);
             state = WorkerState.DRAINING;
             availabilityPublished = false;
+            outstandingHealth = null;
         }
+        outboundQueue.removeIf(item -> item instanceof HealthPing);
         writerThread.interrupt();
     }
 
@@ -282,27 +472,41 @@ final class ManagedPythonWorker {
         if (preTransmission) {
             outboundQueue.remove(assignment);
             assignment.completion().completeExceptionally(timeout);
+            listener.onRequestTerminal(this, assignment, false,
+                    ManagedPythonFailureCategory.REQUEST_TIMEOUT_PRE_TRANSMISSION);
             publishCapacityIfEligible();
         } else if (poisonWorker) {
-            markUnhealthy(timeout);
+            markUnhealthy(ManagedPythonFailureCategory.REQUEST_TIMEOUT_POST_TRANSMISSION, timeout);
         }
     }
 
     void fail(Exception failure) {
-        markUnhealthy(failure);
+        markUnhealthy(ManagedPythonFailureCategory.PROTOCOL_CORRUPTION, failure);
     }
 
-    void forceStop(Exception failure) {
+    void forceStop(Exception failure, long deadlineNs) {
+        initiateForceStop(failure, deadlineNs);
+        finishForceStop(deadlineNs);
+    }
+
+    void initiateForceStop(Exception failure, long deadlineNs) {
         List<Assignment> assignments;
         synchronized (stateLock) {
+            cleanupDeadlineNs = Math.min(cleanupDeadlineNs, deadlineNs);
             if (state != WorkerState.STOPPED) state = WorkerState.STOPPED;
             availabilityPublished = false;
             assignments = drainAssignmentsLocked();
         }
         outboundQueue.clear();
-        completeAllExceptionally(assignments, failure);
+        completeAllExceptionally(assignments, failure, ManagedPythonFailureCategory.SHUTDOWN_TIMEOUT);
         writerThread.interrupt();
-        cleanup(true, System.nanoTime());
+        closeQuietly(channel);
+        forceTerminateProcess();
+    }
+
+    void finishForceStop(long deadlineNs) {
+        cleanup(true, deadlineNs);
+        awaitStopped(deadlineNs);
     }
 
     boolean isStopped() {
@@ -313,7 +517,7 @@ final class ManagedPythonWorker {
         WorkerState observed = state;
         if (observed != WorkerState.DRAINING && observed != WorkerState.STOPPED
                 && observed != WorkerState.UNHEALTHY) {
-            markUnhealthy(new IOException(
+            markUnhealthy(ManagedPythonFailureCategory.PROCESS_EXIT, new IOException(
                     "Managed Python worker exited unexpectedly: workerId=" + workerId
                             + ", generation=" + generation + ", pid=" + workerPid
                             + ", exitCode=" + process.exitValue()));
@@ -334,7 +538,13 @@ final class ManagedPythonWorker {
     boolean awaitStopped(long deadlineNs) {
         try {
             long remaining = remainingNanos(deadlineNs);
-            return remaining > 0 && stopped.await(remaining, TimeUnit.NANOSECONDS);
+            boolean completed = remaining > 0 && stopped.await(remaining, TimeUnit.NANOSECONDS);
+            if (completed) {
+                joinThread(writerThread, deadlineNs);
+                joinThread(responseReader, deadlineNs);
+                outputCapture.join(deadlineNs);
+            }
+            return completed;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             return false;
@@ -351,21 +561,24 @@ final class ManagedPythonWorker {
                     gracefulStop();
                     return;
                 }
-                Assignment assignment;
+                OutboundItem item;
                 try {
-                    assignment = outboundQueue.poll(WRITER_POLL_MILLIS, TimeUnit.MILLISECONDS);
+                    item = outboundQueue.poll(WRITER_POLL_MILLIS, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException interrupted) {
                     if (state == WorkerState.DRAINING) continue;
                     if (state == WorkerState.UNHEALTHY || state == WorkerState.STOPPED) return;
                     Thread.currentThread().interrupt();
-                    markUnhealthy(new IOException("Managed Python worker writer was interrupted", interrupted));
+                    markUnhealthy(ManagedPythonFailureCategory.SOCKET_WRITE_FAILURE,
+                            new IOException("Managed Python worker writer was interrupted", interrupted));
                     return;
                 }
-                if (assignment == null) continue;
-                transmit(assignment);
+                if (item == null) continue;
+                if (item instanceof Assignment assignment) transmit(assignment);
+                else if (item instanceof HealthPing ping) transmitHealth(ping);
             }
         } catch (Exception failure) {
-            markUnhealthy(asException("Managed Python worker request transmission failed", failure));
+            markUnhealthy(ManagedPythonFailureCategory.SOCKET_WRITE_FAILURE,
+                    asException("Managed Python worker request transmission failed", failure));
         }
     }
 
@@ -392,10 +605,45 @@ final class ManagedPythonWorker {
                     assignment.state = AssignmentState.TRANSMITTED;
                 }
             }
-            LOGGER.debug("managedPythonEvent=transmitted workerId={} generation={} pid={} requestId={} timeNs={}",
+            LOGGER.debug("event=managed_python_request_transmitted workerId={} generation={} pid={} requestId={} timeNs={}",
                     workerId, generation, workerPid, assignment.request().requestId(), System.nanoTime());
         } catch (Exception failure) {
-            markUnhealthy(asException("Managed Python worker transport failed", failure));
+            markUnhealthy(ManagedPythonFailureCategory.SOCKET_WRITE_FAILURE,
+                    asException("Managed Python worker transport failed", failure));
+        }
+    }
+
+    private void transmitHealth(HealthPing ping) {
+        synchronized (stateLock) {
+            if (state != WorkerState.RUNNING || outstandingHealth == null
+                    || !outstandingHealth.healthCheckId().equals(ping.healthCheckId())
+                    || outstandingHealth.transmissionState() != HealthTransmissionState.QUEUED) return;
+        }
+        try {
+            PythonRuntimeProtocol.writeFrame(channel, Map.of(
+                    "protocolVersion", PythonRuntimeProtocol.VERSION,
+                    "type", PythonRuntimeProtocol.TYPE_PING,
+                    "healthCheckId", ping.healthCheckId(),
+                    "workerGeneration", ping.generation(),
+                    "expectedWorkerPid", ping.workerPid()), new byte[0], config.maxFrameBytes());
+            long transmittedAtNs = System.nanoTime();
+            synchronized (stateLock) {
+                if (state == WorkerState.RUNNING && outstandingHealth != null
+                        && outstandingHealth.healthCheckId().equals(ping.healthCheckId())
+                        && outstandingHealth.transmissionState() == HealthTransmissionState.QUEUED) {
+                    outstandingHealth = new OutstandingHealth(
+                            ping.healthCheckId(),
+                            HealthTransmissionState.TRANSMITTED,
+                            transmittedAtNs,
+                            transmittedAtNs + TimeUnit.MILLISECONDS.toNanos(config.healthCheckTimeoutMs()));
+                }
+            }
+            listener.onHealthCheckSent(this, ping.healthCheckId());
+            LOGGER.debug("event=managed_python_health_ping workerId={} generation={} pid={} healthCheckId={} timeNs={}",
+                    workerId, generation, workerPid, ping.healthCheckId(), transmittedAtNs);
+        } catch (Exception failure) {
+            markUnhealthy(ManagedPythonFailureCategory.SOCKET_WRITE_FAILURE,
+                    asException("Managed Python worker health transmission failed", failure));
         }
     }
 
@@ -422,18 +670,25 @@ final class ManagedPythonWorker {
         for (Assignment assignment : queuedExpired) {
             outboundQueue.remove(assignment);
             assignment.completion().completeExceptionally(requestTimeout());
+            listener.onRequestTerminal(this, assignment, false,
+                    ManagedPythonFailureCategory.REQUEST_TIMEOUT_PRE_TRANSMISSION);
         }
         if (!queuedExpired.isEmpty()) publishCapacityIfEligible();
-        if (ambiguous != null) markUnhealthy(requestTimeout());
+        if (ambiguous != null) markUnhealthy(
+                ManagedPythonFailureCategory.REQUEST_TIMEOUT_POST_TRANSMISSION, requestTimeout());
     }
 
     private void responseLoop() {
         try {
             while (true) {
                 PythonRuntimeProtocol.Frame frame = PythonRuntimeProtocol.readFrame(channel, config.maxFrameBytes());
-                if ("shutdown_ack".equals(frame.type())) {
+                if (PythonRuntimeProtocol.TYPE_SHUTDOWN_ACK.equals(frame.type())) {
                     shutdownAcknowledged.countDown();
                     return;
+                }
+                if (PythonRuntimeProtocol.TYPE_PONG.equals(frame.type())) {
+                    handlePong(frame.metadata());
+                    continue;
                 }
                 String requestId = stringValue(frame.metadata(), "requestId");
                 Assignment assignment;
@@ -442,7 +697,9 @@ final class ManagedPythonWorker {
                 }
                 if (assignment == null) {
                     if (state == WorkerState.RUNNING) {
-                        throw new IOException("Unknown or duplicate response requestId: " + requestId);
+                        markUnhealthy(ManagedPythonFailureCategory.UNKNOWN_RESPONSE_ID,
+                                new IOException("Unknown or duplicate response requestId: " + requestId));
+                        return;
                     }
                     continue;
                 }
@@ -450,20 +707,20 @@ final class ManagedPythonWorker {
                     requestTimedOut(assignment, requestTimeout());
                     continue;
                 }
-                if ("response".equals(frame.type())) {
+                if (PythonRuntimeProtocol.TYPE_RESPONSE.equals(frame.type())) {
                     int status = numberValue(frame.metadata(), "status");
                     finishAssignment(assignment, new PythonCallResponse(
                             status, responseHeaders(frame.metadata().get("headers")), frame.body()), null);
-                } else if ("error".equals(frame.type())) {
+                } else if (PythonRuntimeProtocol.TYPE_ERROR.equals(frame.type())) {
                     String errorCode = stringValue(frame.metadata(), "code");
                     String errorMessage = stringValue(frame.metadata(), "message");
                     IOException error = pythonError(requestId, errorCode, errorMessage);
                     if (ASGI_EXECUTION_FAILED.equals(errorCode)) {
                         finishAssignment(assignment, null, error);
                     } else if (CAPACITY_EXCEEDED.equals(errorCode)) {
-                        markUnhealthy(error);
+                        markUnhealthy(ManagedPythonFailureCategory.CAPACITY_MISMATCH, error);
                     } else {
-                        markUnhealthy(new IOException(
+                        markUnhealthy(ManagedPythonFailureCategory.PROTOCOL_CORRUPTION, new IOException(
                                 "Unrecognized Python worker error code; capacity and correlation integrity "
                                         + "cannot be trusted: " + error.getMessage(), error));
                     }
@@ -473,9 +730,53 @@ final class ManagedPythonWorker {
             }
         } catch (Exception failure) {
             if (state != WorkerState.STOPPED) {
-                markUnhealthy(asException("Managed Python worker connection failed", failure));
+                ManagedPythonFailureCategory category = failure instanceof EOFException
+                        ? ManagedPythonFailureCategory.SOCKET_EOF
+                        : ManagedPythonFailureCategory.SOCKET_READ_FAILURE;
+                markUnhealthy(category, asException("Managed Python worker connection failed", failure));
             }
         }
+    }
+
+    private void handlePong(Map<String, Object> metadata) {
+        String healthCheckId;
+        int reportedGeneration;
+        long reportedPid;
+        try {
+            healthCheckId = stringValue(metadata, "healthCheckId");
+            reportedGeneration = numberValue(metadata, "workerGeneration");
+            reportedPid = longValue(metadata, "workerPid");
+            numberValue(metadata, "activeTaskCount");
+        } catch (IOException failure) {
+            markUnhealthy(ManagedPythonFailureCategory.HEALTH_CHECK_PROTOCOL_FAILURE, failure);
+            return;
+        }
+        long latency;
+        boolean invalidCorrelation = false;
+        synchronized (stateLock) {
+            if (state != WorkerState.RUNNING) return;
+            if (reportedGeneration != generation) return;
+            if (reportedPid != workerPid || outstandingHealth == null
+                    || !outstandingHealth.healthCheckId().equals(healthCheckId)) {
+                invalidCorrelation = true;
+                latency = 0;
+            } else {
+                latency = outstandingHealth.transmissionState() == HealthTransmissionState.TRANSMITTED
+                        ? Math.max(0, System.nanoTime() - outstandingHealth.transmittedAtNs())
+                        : 0;
+                outstandingHealth = null;
+                lastHealthLatencyNanos = latency;
+                updateResponsiveLocked();
+            }
+        }
+        if (invalidCorrelation) {
+            markUnhealthy(ManagedPythonFailureCategory.HEALTH_CHECK_PROTOCOL_FAILURE,
+                    new IOException("Health response correlation did not match the current worker generation"));
+            return;
+        }
+        listener.onHealthCheckSucceeded(this, healthCheckId, latency);
+        LOGGER.debug("event=managed_python_health_pong workerId={} generation={} pid={} healthCheckId={} latencyNs={}",
+                workerId, generation, workerPid, healthCheckId, latency);
     }
 
     private void finishAssignment(
@@ -489,7 +790,9 @@ final class ManagedPythonWorker {
         }
         if (failure == null) assignment.completion().complete(response);
         else assignment.completion().completeExceptionally(failure);
-        LOGGER.debug("managedPythonEvent=completed workerId={} generation={} pid={} requestId={} inFlight={} maxInFlight={} timeNs={}",
+        markResponsive();
+        listener.onRequestTerminal(this, assignment, failure == null, null);
+        LOGGER.debug("event=managed_python_request_completed workerId={} generation={} pid={} requestId={} inFlight={} maxInFlight={} timeNs={}",
                 workerId, generation, workerPid, assignment.request().requestId(), remainingCount,
                 config.maxInFlightPerWorker(), System.nanoTime());
         publishCapacityIfEligible();
@@ -508,7 +811,7 @@ final class ManagedPythonWorker {
     private void writeRequest(PythonCallRequest request) throws IOException {
         Map<String, Object> metadata = new LinkedHashMap<>();
         metadata.put("protocolVersion", PythonRuntimeProtocol.VERSION);
-        metadata.put("type", "request");
+        metadata.put("type", PythonRuntimeProtocol.TYPE_REQUEST);
         metadata.put("requestId", request.requestId());
         metadata.put("method", request.method());
         metadata.put("path", request.target().getRawPath());
@@ -525,7 +828,7 @@ final class ManagedPythonWorker {
             if (remaining > 0 && channel.isOpen()) {
                 PythonRuntimeProtocol.writeFrame(channel, Map.of(
                         "protocolVersion", PythonRuntimeProtocol.VERSION,
-                        "type", "shutdown"), new byte[0], config.maxFrameBytes());
+                        "type", PythonRuntimeProtocol.TYPE_SHUTDOWN), new byte[0], config.maxFrameBytes());
                 remaining = remainingNanos(shutdownDeadlineNs);
                 if (remaining > 0) shutdownAcknowledged.await(remaining, TimeUnit.NANOSECONDS);
             }
@@ -540,25 +843,27 @@ final class ManagedPythonWorker {
         }
     }
 
-    private void markUnhealthy(Exception failure) {
+    private void markUnhealthy(ManagedPythonFailureCategory category, Exception failure) {
         boolean publish;
         List<Assignment> assignments;
         synchronized (stateLock) {
             if (state == WorkerState.UNHEALTHY || state == WorkerState.STOPPED) return;
             state = WorkerState.UNHEALTHY;
             availabilityPublished = false;
+            outstandingHealth = null;
             assignments = drainAssignmentsLocked();
             publish = failurePublished.compareAndSet(false, true);
         }
         outboundQueue.clear();
-        completeAllExceptionally(assignments, failure);
+        completeAllExceptionally(assignments, failure, category);
         writerThread.interrupt();
         closeQuietly(channel);
         if (process.isAlive()) process.destroy();
         if (publish) {
-            System.err.printf("Managed Python worker unhealthy: workerId=%s, generation=%d, pid=%d, failure=%s%n",
-                    workerId, generation, workerPid, failure.getMessage());
-            listener.onUnhealthy(this, failure);
+            LOGGER.warn("event=managed_python_worker_unhealthy workerId={} generation={} pid={} "
+                            + "failureCategory={} failure={}",
+                    workerId, generation, workerPid, category, boundedMessage(failure));
+            listener.onUnhealthy(this, category, failure);
         }
     }
 
@@ -570,8 +875,14 @@ final class ManagedPythonWorker {
         return assignments;
     }
 
-    private static void completeAllExceptionally(List<Assignment> assignments, Exception failure) {
-        assignments.forEach(assignment -> assignment.completion().completeExceptionally(failure));
+    private void completeAllExceptionally(
+            List<Assignment> assignments,
+            Exception failure,
+            ManagedPythonFailureCategory category) {
+        assignments.forEach(assignment -> {
+            assignment.completion().completeExceptionally(failure);
+            listener.onRequestTerminal(this, assignment, false, category);
+        });
     }
 
     private void terminateUnhealthyProcess() {
@@ -586,28 +897,25 @@ final class ManagedPythonWorker {
         try {
             if (process.isAlive()) {
                 process.destroy();
-                long gracefulWaitNs = remainingNanos(deadlineNs) / 2;
+                long gracefulWaitNs = remainingNanos(effectiveCleanupDeadline(deadlineNs)) / 2;
                 if (gracefulWaitNs > 0) process.waitFor(gracefulWaitNs, TimeUnit.NANOSECONDS);
             }
             if (process.isAlive()) {
-                System.err.printf(
-                        "Managed Python worker force termination: workerId=%s, generation=%d, pid=%d%n",
-                        workerId, generation, workerPid);
-                process.destroyForcibly();
-                long remaining = remainingNanos(deadlineNs);
+                forceTerminateProcess();
+                long remaining = remainingNanos(effectiveCleanupDeadline(deadlineNs));
                 if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
             }
         } catch (InterruptedException exception) {
             interrupted = true;
-            if (process.isAlive()) process.destroyForcibly();
+            forceTerminateProcess();
             try {
-                long remaining = remainingNanos(deadlineNs);
+                long remaining = remainingNanos(effectiveCleanupDeadline(deadlineNs));
                 if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
             } catch (InterruptedException repeated) {
                 // Cleanup below still unblocks the slot; interrupt status is restored afterward.
             }
         } finally {
-            finishCleanup();
+            finishCleanup(deadlineNs);
             if (interrupted) Thread.currentThread().interrupt();
         }
     }
@@ -617,29 +925,53 @@ final class ManagedPythonWorker {
         closeQuietly(channel);
         try {
             if (process.isAlive()) {
-                if (force) process.destroyForcibly();
+                if (force) forceTerminateProcess();
                 else process.destroy();
-                long remaining = remainingNanos(deadlineNs);
+                long remaining = remainingNanos(effectiveCleanupDeadline(deadlineNs));
                 if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
-                if (process.isAlive()) process.destroyForcibly();
+                if (process.isAlive()) {
+                    forceTerminateProcess();
+                }
             }
         } catch (InterruptedException exception) {
-            process.destroyForcibly();
+            forceTerminateProcess();
             Thread.currentThread().interrupt();
         } finally {
-            finishCleanup();
+            finishCleanup(deadlineNs);
         }
     }
 
-    private void finishCleanup() {
+    private void finishCleanup(long deadlineNs) {
         deleteSocket(socketPath);
+        outputCapture.join(effectiveCleanupDeadline(deadlineNs));
         synchronized (stateLock) {
             state = WorkerState.STOPPED;
             availabilityPublished = false;
         }
         stopped.countDown();
-        LOGGER.debug("managedPythonEvent=stopped workerId={} generation={} pid={} socketRemoved={}",
+        if (Files.exists(socketPath)) {
+            listener.onCleanupFailure(this, "Worker socket remained after cleanup", null);
+        }
+        if (process.isAlive()) {
+            listener.onCleanupFailure(this,
+                    "Worker process remained alive after forced cleanup: pid=" + workerPid, null);
+        }
+        LOGGER.info("event=managed_python_worker_stopped workerId={} generation={} pid={} socketRemoved={}",
                 workerId, generation, workerPid, !Files.exists(socketPath));
+    }
+
+    private void forceTerminateProcess() {
+        if (!process.isAlive()) return;
+        if (forcedTerminationPublished.compareAndSet(false, true)) {
+            LOGGER.warn("event=managed_python_worker_force_terminated workerId={} generation={} pid={}",
+                    workerId, generation, workerPid);
+            listener.onForcedTermination(this);
+        }
+        process.destroyForcibly();
+    }
+
+    private long effectiveCleanupDeadline(long candidateDeadlineNs) {
+        return Math.min(candidateDeadlineNs, cleanupDeadlineNs);
     }
 
     @SuppressWarnings("unchecked")
@@ -688,9 +1020,17 @@ final class ManagedPythonWorker {
         if (remaining <= 0) throw new TimeoutException("Python worker readiness timed out");
         try {
             return task.get(remaining, TimeUnit.NANOSECONDS);
+        } catch (ExecutionException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof IOException ioFailure) throw ioFailure;
+            if (cause instanceof Exception exception) throw exception;
+            throw new IOException("Python worker readiness failed", cause);
         } catch (TimeoutException timeout) {
             closeQuietly(channel);
             throw new TimeoutException("Python worker readiness timed out");
+        } finally {
+            if (!task.isDone()) task.cancel(true);
+            joinThread(thread, deadlineNs);
         }
     }
 
@@ -706,6 +1046,23 @@ final class ManagedPythonWorker {
         Object value = metadata.get(name);
         if (!(value instanceof Number number)) throw new IOException("Missing numeric protocol field: " + name);
         return number.intValue();
+    }
+
+    private static long longValue(Map<String, Object> metadata, String name) throws IOException {
+        Object value = metadata.get(name);
+        if (!(value instanceof Number number)) throw new IOException("Missing numeric protocol field: " + name);
+        return number.longValue();
+    }
+
+    private void markResponsive() {
+        synchronized (stateLock) {
+            updateResponsiveLocked();
+        }
+    }
+
+    private void updateResponsiveLocked() {
+        lastResponsiveNs = System.nanoTime();
+        lastResponsiveEpochMillis = System.currentTimeMillis();
     }
 
     private TimeoutException requestTimeout() {
@@ -728,12 +1085,18 @@ final class ManagedPythonWorker {
                 : new IOException(message, failure);
     }
 
-    private static void stopProcess(Process process, long timeoutMs) {
+    private static void stopProcess(Process process, long deadlineNs) {
         if (process == null) return;
         try {
-            if (process.isAlive() && !process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+            long remaining = remainingNanos(deadlineNs);
+            if (process.isAlive() && (remaining <= 0
+                    || !process.waitFor(remaining, TimeUnit.NANOSECONDS))) {
                 process.destroy();
-                if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) process.destroyForcibly();
+                remaining = remainingNanos(deadlineNs);
+                if (process.isAlive() && (remaining <= 0
+                        || !process.waitFor(remaining, TimeUnit.NANOSECONDS))) {
+                    process.destroyForcibly();
+                }
             }
         } catch (InterruptedException exception) {
             process.destroyForcibly();
@@ -745,7 +1108,8 @@ final class ManagedPythonWorker {
         try {
             Files.deleteIfExists(socketPath);
         } catch (IOException failure) {
-            System.err.printf("Unable to remove managed worker socket %s: %s%n", socketPath, failure.getMessage());
+            LOGGER.error("event=managed_python_cleanup_failed resource=worker_socket path={} failure={}",
+                    socketPath, boundedMessage(failure));
         }
     }
 
@@ -760,5 +1124,92 @@ final class ManagedPythonWorker {
 
     private static long remainingNanos(long deadlineNs) {
         return Math.max(0, deadlineNs - System.nanoTime());
+    }
+
+    private static void joinThread(Thread thread, long deadlineNs) {
+        if (thread == null || thread == Thread.currentThread()) return;
+        try {
+            long remaining = remainingNanos(deadlineNs);
+            if (remaining > 0) TimeUnit.NANOSECONDS.timedJoin(thread, remaining);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static String boundedMessage(Throwable failure) {
+        if (failure == null) return "none";
+        String message = failure.getMessage();
+        if (message == null || message.isBlank()) message = failure.getClass().getSimpleName();
+        message = message.replace('\n', ' ').replace('\r', ' ');
+        return message.length() <= 512 ? message : message.substring(0, 512);
+    }
+
+    private static final class ProcessOutputCapture {
+        private static final int READ_BUFFER_BYTES = 4_096;
+        private static final int LOG_CHUNK_LIMIT = 1_024;
+        private static final int MAX_CHUNKS_PER_MINUTE = 20;
+
+        private final InputStream input;
+        private final String workerId;
+        private final int generation;
+        private final long pid;
+        private final Thread thread;
+
+        private ProcessOutputCapture(InputStream input, String workerId, int generation, long pid) {
+            this.input = input;
+            this.workerId = workerId;
+            this.generation = generation;
+            this.pid = pid;
+            this.thread = new Thread(this::drain,
+                    "managed-python-output-" + workerId + "-g" + generation);
+        }
+
+        private void start() {
+            thread.start();
+        }
+
+        private void drain() {
+            byte[] buffer = new byte[READ_BUFFER_BYTES];
+            long windowStarted = System.nanoTime();
+            int emitted = 0;
+            long suppressed = 0;
+            try (input) {
+                int count;
+                while ((count = input.read(buffer)) >= 0) {
+                    long now = System.nanoTime();
+                    if (now - windowStarted >= TimeUnit.MINUTES.toNanos(1)) {
+                        if (suppressed > 0) logSuppressed(suppressed);
+                        windowStarted = now;
+                        emitted = 0;
+                        suppressed = 0;
+                    }
+                    if (emitted < MAX_CHUNKS_PER_MINUTE) {
+                        String output = new String(buffer, 0, Math.min(count, LOG_CHUNK_LIMIT),
+                                java.nio.charset.StandardCharsets.UTF_8)
+                                .replace('\n', ' ').replace('\r', ' ');
+                        LOGGER.debug("event=managed_python_worker_output workerId={} generation={} pid={} "
+                                        + "stream=combined output={}",
+                                workerId, generation, pid, output);
+                        emitted++;
+                    } else {
+                        suppressed++;
+                    }
+                }
+            } catch (IOException failure) {
+                LOGGER.debug("event=managed_python_worker_output_closed workerId={} generation={} pid={} failure={}",
+                        workerId, generation, pid, boundedMessage(failure));
+            } finally {
+                if (suppressed > 0) logSuppressed(suppressed);
+            }
+        }
+
+        private void logSuppressed(long suppressed) {
+            LOGGER.debug("event=managed_python_worker_output_suppressed workerId={} generation={} pid={} chunks={}",
+                    workerId, generation, pid, suppressed);
+        }
+
+        private void join(long deadlineNs) {
+            joinThread(thread, deadlineNs);
+        }
     }
 }

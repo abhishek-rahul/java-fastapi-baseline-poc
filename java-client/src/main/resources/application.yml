@@ -34,3 +34,7 @@ managed-python-runtime:
   restart-maximum-backoff-ms: 2000
   restart-max-attempts: 3
   restart-window-ms: 60000
+  health-check-enabled: true
+  health-check-interval-ms: 5000
+  health-check-timeout-ms: 1000
+  health-check-startup-grace-ms: 5000

@@ -106,6 +106,7 @@ async def run_worker(
                 "type": "ready",
                 "workerPid": os.getpid(),
                 "maxInFlightPerWorker": max_in_flight_per_worker,
+                "healthCheckSupported": True,
             },
             b"",
         )
@@ -113,6 +114,28 @@ async def run_worker(
             while True:
                 metadata, body = await read_frame(reader, max_frame_bytes)
                 message_type = metadata["type"]
+                if message_type == "ping":
+                    health_check_id = metadata.get("healthCheckId")
+                    worker_generation = metadata.get("workerGeneration")
+                    expected_worker_pid = metadata.get("expectedWorkerPid")
+                    if not isinstance(health_check_id, str) or not health_check_id:
+                        raise ValueError("Health check ID is required")
+                    if not isinstance(worker_generation, int) or worker_generation < 1:
+                        raise ValueError("Worker generation is required")
+                    if expected_worker_pid != os.getpid():
+                        raise ValueError("Health check worker PID does not match this process")
+                    await write_serialized(
+                        {
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "type": "pong",
+                            "healthCheckId": health_check_id,
+                            "workerGeneration": worker_generation,
+                            "workerPid": os.getpid(),
+                            "activeTaskCount": len(active_tasks),
+                        },
+                        b"",
+                    )
+                    continue
                 if message_type == "shutdown":
                     if active_tasks:
                         await asyncio.gather(*list(active_tasks.values()), return_exceptions=True)
