@@ -29,7 +29,7 @@ case "$MODE" in
         UVICORN_PID=$!
         ;;
     MANAGED_RUNTIME)
-        echo "Starting Java with one Managed Python Runtime worker; Uvicorn is not started."
+        echo "Starting Java with the configured Managed Python Runtime worker pool; Uvicorn is not started."
         ;;
     *)
         echo "Unsupported mode '$MODE'. Expected HTTP or MANAGED_RUNTIME." >&2
@@ -77,8 +77,16 @@ case "$RUN_TARGET" in
     E2E_SHUTDOWN_TIMEOUT)
         java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE" SHUTDOWN_TIMEOUT
         ;;
+    PHASE2_E2E)
+        SCENARIO="${3:-}"
+        if [ "$MODE" != "MANAGED_RUNTIME" ] || [ -z "$SCENARIO" ]; then
+            echo "PHASE2_E2E requires: MANAGED_RUNTIME PHASE2_E2E <SCENARIO>." >&2
+            exit 2
+        fi
+        java -cp /app/java-client.jar com.example.baseline.e2e.Phase2E2ERunner "$SCENARIO"
+        ;;
     *)
-        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION, E2E, E2E_SHUTDOWN_DRAIN, or E2E_SHUTDOWN_TIMEOUT." >&2
+        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION, E2E, E2E_SHUTDOWN_DRAIN, E2E_SHUTDOWN_TIMEOUT, or PHASE2_E2E." >&2
         exit 2
         ;;
 esac
