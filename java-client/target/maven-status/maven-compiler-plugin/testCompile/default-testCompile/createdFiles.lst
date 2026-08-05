@@ -1,0 +1,3 @@
+com\example\baseline\client\RestProcessingClientTest.class
+com\example\baseline\utils\config\YamlConfigLoaderTest.class
+com\example\baseline\utils\http\HttpUtilTest.class

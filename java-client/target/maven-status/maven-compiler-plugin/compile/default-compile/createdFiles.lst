@@ -1,0 +1,11 @@
+com\example\baseline\client\RestProcessingClient.class
+com\example\baseline\utils\config\ApplicationConfig$FastApiConfig.class
+com\example\baseline\dto\ProcessResponse.class
+com\example\baseline\utils\config\ApplicationConfig.class
+com\example\baseline\utils\config\ApplicationConfig$HttpClientConfig.class
+com\example\baseline\dto\CallResult.class
+com\example\baseline\utils\http\HttpUtil.class
+com\example\baseline\BaselineApplication.class
+com\example\baseline\utils\config\ApplicationConfig$WorkloadConfig.class
+com\example\baseline\utils\config\YamlConfigLoader.class
+com\example\baseline\dto\ProcessRequest.class

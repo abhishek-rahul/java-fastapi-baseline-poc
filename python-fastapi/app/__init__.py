@@ -1,0 +1,1 @@
+"""FastAPI baseline application package."""

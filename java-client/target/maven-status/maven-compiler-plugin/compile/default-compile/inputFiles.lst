@@ -1,0 +1,8 @@
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\BaselineApplication.java
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\client\RestProcessingClient.java
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\dto\CallResult.java
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\dto\ProcessRequest.java
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\dto\ProcessResponse.java
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\utils\config\ApplicationConfig.java
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\utils\config\YamlConfigLoader.java
+C:\gitcode\phenom_poc\java-fastapi-baseline-same-container-docker\java-fastapi-baseline-poc\java-client\src\main\java\com\example\baseline\utils\http\HttpUtil.java

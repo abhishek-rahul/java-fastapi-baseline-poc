@@ -1,0 +1,13 @@
+[project]
+name = "python-fastapi-baseline"
+version = "1.0.0"
+description = "Async FastAPI baseline used by the Java OkHttp POC"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
