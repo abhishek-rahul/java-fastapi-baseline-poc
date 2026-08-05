@@ -5,7 +5,8 @@ import com.example.baseline.dto.CallResult;
 import com.example.baseline.dto.ProcessRequest;
 import com.example.baseline.utils.config.ApplicationConfig;
 import com.example.baseline.utils.config.YamlConfigLoader;
-import com.example.baseline.utils.http.HttpUtil;
+import com.example.baseline.utils.python.PythonCallMode;
+import com.example.baseline.utils.python.PythonCallUtil;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -23,9 +24,11 @@ public final class BaselineApplication {
     }
 
     public static void main(String[] args) {
+        PythonCallMode mode = PythonCallMode.fromArguments(args);
         ApplicationConfig config = YamlConfigLoader.load();
+        config.validateFor(mode);
         ApplicationConfig.WorkloadConfig workload = config.workload();
-        HttpUtil.initialize(config.httpClient());
+        PythonCallUtil.initialize(mode, config);
         ExecutorService requestExecutor = Executors.newFixedThreadPool(
                 workload.threadPoolSize(),
                 runnable -> {
@@ -36,7 +39,8 @@ public final class BaselineApplication {
         );
 
         System.out.printf(
-                "Starting baseline: processUrl=%s, method=%s, threadPoolSize=%d, requestCount=%d, delayMs=%d%n",
+                "Starting baseline: mode=%s, processUrl=%s, method=%s, threadPoolSize=%d, requestCount=%d, delayMs=%d%n",
+                mode,
                 config.fastApi().processUrl(),
                 config.fastApi().method(),
                 workload.threadPoolSize(),
@@ -106,7 +110,7 @@ public final class BaselineApplication {
                 requestExecutor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
-            HttpUtil.close();
+            PythonCallUtil.close();
         }
     }
 

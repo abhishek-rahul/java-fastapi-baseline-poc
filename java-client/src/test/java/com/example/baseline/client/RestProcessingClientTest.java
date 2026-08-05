@@ -2,14 +2,18 @@ package com.example.baseline.client;
 
 import com.example.baseline.dto.CallResult;
 import com.example.baseline.dto.ProcessRequest;
+import com.example.baseline.utils.config.ApplicationConfig;
 import com.example.baseline.utils.config.ApplicationConfig.FastApiConfig;
 import com.example.baseline.utils.config.ApplicationConfig.HttpClientConfig;
-import com.example.baseline.utils.http.HttpUtil;
+import com.example.baseline.utils.config.ApplicationConfig.WorkloadConfig;
+import com.example.baseline.utils.python.PythonCallMode;
+import com.example.baseline.utils.python.PythonCallUtil;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 
 import java.io.IOException;
 import java.util.Map;
@@ -18,19 +22,28 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class RestProcessingClientTest {
     private MockWebServer server;
+    private FastApiConfig fastApiConfig;
 
-    @BeforeEach
+    @BeforeAll
     void setUp() throws IOException {
         server = new MockWebServer();
         server.start();
-        HttpUtil.initialize(new HttpClientConfig(1_000, 1_000, 1_000, 1_000, 2, 10_000));
+        fastApiConfig = new FastApiConfig(
+                server.url("/api/v1/process").toString(), "POST", Map.of("Accept", "application/json"));
+        PythonCallUtil.initialize(PythonCallMode.HTTP, new ApplicationConfig(
+                fastApiConfig,
+                new WorkloadConfig(1, 1, 0),
+                new HttpClientConfig(1_000, 1_000, 1_000, 1_000, 2, 10_000),
+                null
+        ));
     }
 
-    @AfterEach
+    @AfterAll
     void tearDown() throws IOException {
-        HttpUtil.close();
+        PythonCallUtil.close();
         server.shutdown();
     }
 
@@ -62,7 +75,6 @@ class RestProcessingClientTest {
     }
 
     private RestProcessingClient client() {
-        return new RestProcessingClient(new FastApiConfig(
-                server.url("/api/v1/process").toString(), "POST", Map.of("Accept", "application/json")));
+        return new RestProcessingClient(fastApiConfig);
     }
 }
