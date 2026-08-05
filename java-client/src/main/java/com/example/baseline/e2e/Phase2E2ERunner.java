@@ -33,7 +33,7 @@ public final class Phase2E2ERunner {
         if (args.length != 1) {
             throw new IllegalArgumentException("Usage: Phase2E2ERunner <SCENARIO>");
         }
-        ApplicationConfig base = YamlConfigLoader.load();
+        ApplicationConfig base = phase2Compatible(YamlConfigLoader.load());
         switch (args[0]) {
             case "PARALLEL" -> parallel(base);
             case "QUEUE" -> queue(base);
@@ -151,7 +151,7 @@ public final class Phase2E2ERunner {
         ManagedPythonRuntimeConfig invalid = new ManagedPythonRuntimeConfig(
                 "phase2-python-command-does-not-exist",
                 original.applicationDirectory(), original.udsDirectory(), 2,
-                original.queueCapacity(), 500, original.maxFrameBytes(), 750,
+                1, original.queueCapacity(), 500, original.maxFrameBytes(), 750,
                 original.requestTimeoutMs(), 1_000, false, 0, 0, 0, 1_000);
         ApplicationConfig config = withManaged(base, invalid);
         Set<Long> before = workerPids();
@@ -417,9 +417,19 @@ public final class Phase2E2ERunner {
         ManagedPythonRuntimeConfig value = base.managedPythonRuntime();
         return new ManagedPythonRuntimeConfig(
                 value.pythonExecutable(), value.applicationDirectory(), value.udsDirectory(), workers,
-                queueCapacity, queueTimeoutMs, value.maxFrameBytes(), value.startupTimeoutMs(),
+                1, queueCapacity, queueTimeoutMs, value.maxFrameBytes(), value.startupTimeoutMs(),
                 requestTimeoutMs, shutdownTimeoutMs, restartEnabled, 50, 200,
                 restartAttempts, 5_000);
+    }
+
+    private static ApplicationConfig phase2Compatible(ApplicationConfig base) {
+        ManagedPythonRuntimeConfig value = base.managedPythonRuntime();
+        return withManaged(base, new ManagedPythonRuntimeConfig(
+                value.pythonExecutable(), value.applicationDirectory(), value.udsDirectory(),
+                value.workerCount(), 1, value.queueCapacity(), value.queueTimeoutMs(),
+                value.maxFrameBytes(), value.startupTimeoutMs(), value.requestTimeoutMs(),
+                value.shutdownTimeoutMs(), value.restartEnabled(), value.restartInitialBackoffMs(),
+                value.restartMaximumBackoffMs(), value.restartMaxAttempts(), value.restartWindowMs()));
     }
 
     private static ApplicationConfig withManaged(

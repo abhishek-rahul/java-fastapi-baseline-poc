@@ -78,6 +78,7 @@ public record ApplicationConfig(
             @JsonProperty("application-directory") String applicationDirectory,
             @JsonProperty("uds-directory") String udsDirectory,
             @JsonProperty("worker-count") int workerCount,
+            @JsonProperty("max-in-flight-per-worker") int maxInFlightPerWorker,
             @JsonProperty("queue-capacity") int queueCapacity,
             @JsonProperty("queue-timeout-ms") long queueTimeoutMs,
             @JsonProperty("max-frame-bytes") int maxFrameBytes,
@@ -97,6 +98,10 @@ public record ApplicationConfig(
             if (workerCount < 1 || workerCount > 64) {
                 throw new IllegalArgumentException(
                         "managed-python-runtime.worker-count must be between 1 and 64");
+            }
+            if (maxInFlightPerWorker < 1 || maxInFlightPerWorker > 64) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.max-in-flight-per-worker must be between 1 and 64");
             }
             if (queueCapacity <= 0) {
                 throw new IllegalArgumentException(
@@ -136,6 +141,7 @@ public record ApplicationConfig(
                     Path.of(applicationDirectory).toAbsolutePath().normalize().toString(),
                     Path.of(udsDirectory).toAbsolutePath().normalize().toString(),
                     workerCount,
+                    maxInFlightPerWorker,
                     queueCapacity,
                     queueTimeoutMs,
                     maxFrameBytes,
