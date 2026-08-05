@@ -85,8 +85,17 @@ case "$RUN_TARGET" in
         fi
         java -cp /app/java-client.jar com.example.baseline.e2e.Phase2E2ERunner "$SCENARIO"
         ;;
+    PHASE3_E2E)
+        SCENARIO="${3:-}"
+        if [ "$MODE" != "MANAGED_RUNTIME" ] || [ -z "$SCENARIO" ]; then
+            echo "PHASE3_E2E requires: MANAGED_RUNTIME PHASE3_E2E <SCENARIO>." >&2
+            exit 2
+        fi
+        java -Dorg.slf4j.simpleLogger.defaultLogLevel=debug \
+            -cp /app/java-client.jar com.example.baseline.e2e.Phase3E2ERunner "$SCENARIO"
+        ;;
     *)
-        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION, E2E, E2E_SHUTDOWN_DRAIN, E2E_SHUTDOWN_TIMEOUT, or PHASE2_E2E." >&2
+        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION, E2E, E2E_SHUTDOWN_DRAIN, E2E_SHUTDOWN_TIMEOUT, PHASE2_E2E, or PHASE3_E2E." >&2
         exit 2
         ;;
 esac

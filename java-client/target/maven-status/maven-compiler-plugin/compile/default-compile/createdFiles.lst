@@ -7,6 +7,7 @@ com\example\baseline\BaselineApplication.class
 com\example\baseline\utils\python\PythonCallMode.class
 com\example\baseline\utils\python\PythonRuntimeProtocol.class
 com\example\baseline\e2e\Phase2E2ERunner$Outcome.class
+com\example\baseline\e2e\Phase3E2ERunner$Observation.class
 com\example\baseline\e2e\Phase2E2ERunner.class
 com\example\baseline\utils\config\YamlConfigLoader.class
 com\example\baseline\utils\python\ManagedPythonRuntime$PoolState.class
@@ -15,9 +16,11 @@ com\example\baseline\utils\python\PythonCallUtil$LifecycleState.class
 com\example\baseline\utils\http\HttpUtil.class
 com\example\baseline\utils\config\ApplicationConfig$WorkloadConfig.class
 com\example\baseline\utils\python\ManagedPythonWorker$WorkerState.class
+com\example\baseline\utils\python\ManagedPythonWorker$AssignmentState.class
 com\example\baseline\utils\python\PythonCallUtil.class
 com\example\baseline\utils\python\PythonRuntimeProtocol$Frame.class
 com\example\baseline\e2e\Phase1E2ERunner.class
+com\example\baseline\e2e\Phase3E2ERunner$Outcome.class
 com\example\baseline\dto\ProcessResponse.class
 com\example\baseline\utils\python\PythonCallExecutor.class
 com\example\baseline\utils\python\ManagedPythonRuntime.class
@@ -31,4 +34,5 @@ com\example\baseline\utils\python\PythonCallUtil$EffectiveConfiguration.class
 com\example\baseline\client\RestProcessingClient.class
 com\example\baseline\utils\config\ApplicationConfig$FastApiConfig.class
 com\example\baseline\utils\python\PythonCallResponse.class
+com\example\baseline\e2e\Phase3E2ERunner.class
 com\example\baseline\utils\python\PythonCallRequest.class

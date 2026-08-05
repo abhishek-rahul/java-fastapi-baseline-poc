@@ -267,3 +267,107 @@ Date: 2026-08-05
 ### Focused acceptance result
 
 PASS — unhealthy-process termination is bounded, the active request completes exceptionally exactly once, slot replacement proceeds with a new PID, no caller future/process/socket/container is leaked, and all requested Phase 2 regressions pass. No Phase 3 work was started.
+
+---
+
+# Phase 3 - Unified Async ASGI Concurrency
+
+State: COMPLETE
+Date: 2026-08-05
+Environment: Windows 10 host with Docker Linux containers; final image uses Java 17 and Python 3.12
+
+## Implemented
+
+- Added bounded `max-in-flight-per-worker` configuration and readiness verification, with Phase 2 scenarios pinned to capacity one.
+- Replaced each worker's single active assignment with a bounded request-ID registry, in-flight counter, bounded outbound queue, one non-waiting socket writer, and one correlated response reader.
+- Added capacity-aware, one-token worker publication. The FIFO dispatcher reserves one slot, republishes remaining capacity at the queue tail, and never waits for Python execution or a response.
+- Updated the Python worker to read requests continuously, run each request as an independent bounded asyncio task through `app.main:app`, serialize complete response frames, and permit correlated out-of-order completion.
+- Added exact terminal ownership for response, request error, pre-transmission timeout, transmitted timeout, worker failure, and shutdown paths. Ambiguous failures poison the worker and never retry business work.
+- Extended common-deadline shutdown to drain multiple active assignments concurrently and force all remaining workers/futures terminal at the deadline.
+- Added the real-process `Phase3E2ERunner` and `MANAGED_RUNTIME PHASE3_E2E <SCENARIO>` routing. No unit tests or production failure-injection hooks were added.
+
+## Files changed
+
+- `java-client/src/main/java/com/example/baseline/utils/python/ManagedPythonRuntime.java`
+- `java-client/src/main/java/com/example/baseline/utils/python/ManagedPythonWorker.java`
+- `java-client/src/main/java/com/example/baseline/utils/config/ApplicationConfig.java`
+- `java-client/src/main/resources/application.yml`
+- `python-fastapi/python_runtime/worker_runtime.py`
+- `java-client/src/main/java/com/example/baseline/e2e/Phase2E2ERunner.java`
+- `java-client/src/main/java/com/example/baseline/e2e/Phase3E2ERunner.java`
+- `docker-entrypoint.sh`
+- `docs/codex/PHASE_STATUS.md`
+
+## Commands and observed results
+
+- `cd java-client; mvn -DskipTests clean package`
+  Result: PASS - 20 main sources and 3 existing test sources compiled for Java 17; the shaded JAR was built in 8.156 seconds.
+- `cd java-client; mvn test`
+  Result: PASS - 8 existing tests, 0 failures, 0 errors, 0 skipped; total time 8.497 seconds.
+- Python source compilation of `python-fastapi/python_runtime/worker_runtime.py`
+  Result: PASS - the modified worker runtime compiled successfully.
+- `docker build --no-cache --progress=plain -t java-fastapi-runtime-poc .`
+  Result: PASS - the exact final source built in a clean Java 17/Python 3.12 image in 81.8 seconds.
+- `docker run --rm java-fastapi-runtime-poc HTTP`
+  Result: PASS - real Uvicorn/OkHttp completed 1,000/1,000 requests; batch 3,072.052 ms; average Python work 10.160 ms.
+- `docker run --rm java-fastapi-runtime-poc HTTP E2E`
+  Result: PASS - the existing real HTTP success, headers, 422/non-2xx, lifecycle, and concurrent-caller regression passed.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME`
+  Result: PASS - four Java-owned CPython workers completed 1,000/1,000 requests without Uvicorn; batch 3,022.045 ms; average Python work 10.197 ms.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E`
+  Result: PASS - the existing managed success, headers, 422/non-2xx, lifecycle, and concurrent-caller regression passed.
+- Final Phase 2 capacity-one matrix: `PARALLEL`, `QUEUE`, `IDLE_FAILURE`, `BUSY_FAILURE`, `STARTUP_FAILURE`, `RESTART_EXHAUSTION`, `REQUEST_TIMEOUT`, `UNHEALTHY_FORCE_TERMINATION`, `SHUTDOWN`, and `SHUTDOWN_TIMEOUT`
+  Result: PASS - all ten scenarios passed against the final no-cache image. Observations included four-way process overlap in 1,035.722 ms, bounded queue failure with every future terminal, idle PID 34 replaced by PID 59, one non-retried busy failure with replacement PID 63, bounded startup failure in 100 ms, restart exhaustion after three generations, request-timeout replacement PID 29 to PID 42, forced unhealthy termination in 891 ms, four-request graceful drain in 701 ms, and a 515 ms forced shutdown against one 500 ms deadline.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E SAME_WORKER`
+  Result: PASS - one PID executed four overlapping 500 ms ASGI requests with max-in-flight four; wall time 539.601 ms; every response mapping was correct.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E MULTI_WORKER`
+  Result: PASS - two PIDs each accepted at most three requests, total overlap reached six, wall time was 545.175 ms, and response mappings were correct.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E OUT_OF_ORDER`
+  Result: PASS - completion order `[order-1, order-3, order-2, order-0]` differed from submission order `[order-0, order-1, order-2, order-3]`; all four IDs and bodies correlated correctly.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E CAPACITY`
+  Result: PASS - one worker with capacity two and queue capacity two accepted no more than two overlapping requests; four of six calls failed within the bounded policy; every future was terminal; elapsed time was 1,042 ms.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E MULTI_ACTIVE_FAILURE`
+  Result: PASS - killing real PID 29 failed its three assignments without retry, all three assignments on the other worker succeeded, replacement PID 52 restored capacity, and every future was terminal.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E MULTI_ACTIVE_TIMEOUT`
+  Result: PASS - a transmitted timeout poisoned PID 28, all three sibling assignments failed without retry, replacement PID 44 served subsequent work, and every future was terminal.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E CORRELATED_ERROR`
+  Result: PASS - one genuine request-specific ASGI adapter error failed only that request; three siblings succeeded; PID 28 was reused and released capacity served a subsequent request.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E SHUTDOWN`
+  Result: PASS - six active tasks drained concurrently, four queued calls failed, new calls were rejected, every future was terminal, shutdown took 346 ms, and PIDs 29 and 30 plus their runtime directory were removed.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E SHUTDOWN_TIMEOUT`
+  Result: PASS - six active tasks exceeded one shared 500 ms deadline, all failed deterministically, shutdown returned in 506 ms, and PIDs 29 and 30 plus their runtime directory were removed.
+- Three additional `SAME_WORKER` and `MULTI_WORKER` repetitions
+  Result: PASS - same-worker overlap remained four with 531.332-544.501 ms wall times; multi-worker overlap remained six with 530.586-534.362 ms wall times; every run removed all child processes, worker sockets, and pool directories.
+- `docker ps -a --filter ancestor=java-fastapi-runtime-poc --format "{{.ID}} {{.Status}} {{.Names}}"`
+  Result: PASS - output was empty after the final and repeated runs; no test container remained.
+- `git diff --check`
+  Result: PASS - no whitespace errors were reported.
+- Source audit using `git diff --name-only` and `rg`
+  Result: PASS - FastAPI application files, `asgi_adapter.py`, HTTP utility/executor, REST client, CLI entry point, public `PythonCallUtil`, and protocol framing remained unchanged; no CPU/I/O split, route classification, separate pool, or GIL manipulation was introduced.
+
+## Acceptance gates
+
+- PASS - Java clean package and all eight existing tests succeed; no new unit tests were added.
+- PASS - unchanged HTTP/Uvicorn/OkHttp application and E2E flows pass; rollback remains the `HTTP` mode argument only.
+- PASS - managed execution still uses Java-owned CPython processes, UDS, one shared ASGI lifespan per process, and direct `app.main:app` invocation without Uvicorn or internal HTTP.
+- PASS - one process executes four overlapping ASGI tasks; two processes execute six overlapping tasks while respecting three slots per worker.
+- PASS - correlated responses may finish out of order without caller or payload mismatch.
+- PASS - worker availability is capacity-aware and bounded; FIFO admission, queue timeout, frame size, startup, request, restart, and shutdown bounds remain enforced.
+- PASS - request-specific Python errors release only their assignment; transmitted timeout and worker death fail all affected assignments once, poison the generation, and restore capacity under a new PID without retry.
+- PASS - Phase 2 capacity-one behavior, degraded/unavailable handling, restart budgets, and bounded unhealthy-process termination remain intact.
+- PASS - graceful shutdown drains all active tasks concurrently; forced shutdown uses one pool deadline and leaves every future terminal.
+- PASS - repeated runs leave no live CPython descendant, UDS socket, runtime directory, or container; process exit also closes each generation's descriptors and asyncio tasks.
+- PASS - FastAPI application code and the ASGI adapter remain unchanged; source contains no CPU/I/O split or GIL manipulation.
+
+## Phase 3 limitations
+
+- Concurrency is fixed by configured process count and per-worker capacity; there is no autoscaling or per-request cancellation protocol.
+- A timeout after transmission poisons the complete worker generation because Python execution is ambiguous; requests are never retried automatically.
+- Responses are buffered framed messages; TCP transport and streaming remain deferred.
+- Managed UDS E2E was executed in Linux containers, not on the Windows host.
+- The existing FastAPI/Pydantic dependency combination emits alias-related warnings; request/response behavior passed and FastAPI application files were not changed.
+- Advanced metrics, production observability, rollout controls, and new unit/component tests remain deferred.
+
+## Final statement
+
+Phase 3 complete

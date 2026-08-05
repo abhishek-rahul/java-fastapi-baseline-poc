@@ -22,6 +22,7 @@ managed-python-runtime:
   application-directory: "../python-fastapi"
   uds-directory: "../.managed-python-runtime"
   worker-count: 4
+  max-in-flight-per-worker: 4
   queue-capacity: 64
   queue-timeout-ms: 5000
   max-frame-bytes: 1048576

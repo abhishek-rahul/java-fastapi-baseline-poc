@@ -128,10 +128,19 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
             TimeoutException timeout = new TimeoutException("Managed Python Runtime request timed out");
             timeout.initCause(waitTimeout);
             admissionQueue.remove(submission);
-            submission.completion.completeExceptionally(timeout);
+            boolean timeoutWon = submission.completion.completeExceptionally(timeout);
             ManagedPythonWorker worker = submission.assignedWorker.get();
             ManagedPythonWorker.Assignment assignment = submission.assignment;
             if (worker != null && assignment != null) worker.requestTimedOut(assignment, timeout);
+            if (!timeoutWon) {
+                try {
+                    return submission.completion.get();
+                } catch (ExecutionException completedFailure) {
+                    Throwable cause = completedFailure.getCause();
+                    if (cause instanceof Exception checked) throw checked;
+                    throw new IllegalStateException("Managed Python Runtime request failed", cause);
+                }
+            }
             throw timeout;
         } catch (ExecutionException failure) {
             Throwable cause = failure.getCause();
@@ -188,43 +197,57 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
             ManagedPythonWorker worker = availableWorkers.poll(
                     Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(50)), TimeUnit.NANOSECONDS);
             if (worker == null) continue;
+            worker.consumeAvailabilityPublication();
             WorkerSlot slot = slotFor(worker.workerId());
-            if (!slot.isCurrent(worker) || !worker.isReady()) continue;
+            if (!slot.isCurrent(worker) || !worker.isRunning()) continue;
 
             ManagedPythonWorker.Assignment assignment = new ManagedPythonWorker.Assignment(
-                    submission.request,
-                    submission.completion,
-                    System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.requestTimeoutMs()));
+                    submission.request, submission.completion);
             synchronized (dispatchStateLock) {
                 if (!accepting.get() || submission.completion.isDone()) {
-                    if (accepting.get() && worker.isReady()) availableWorkers.offer(worker);
+                    if (accepting.get()) publishAvailable(worker);
                     if (!submission.completion.isDone()) {
                         submission.completion.completeExceptionally(shutdownFailure());
                     }
                     return;
                 }
-                if (!worker.tryAssign(assignment)) continue;
                 submission.assignment = assignment;
                 submission.assignedWorker.set(worker);
+                if (!worker.tryReserveAndEnqueue(assignment)) {
+                    submission.assignment = null;
+                    submission.assignedWorker.compareAndSet(worker, null);
+                    publishAvailable(worker);
+                    continue;
+                }
             }
+            publishAvailable(worker);
             return;
         }
         if (!submission.completion.isDone()) submission.completion.completeExceptionally(shutdownFailure());
     }
 
     @Override
-    public void onReady(ManagedPythonWorker worker) {
+    public void onCapacityAvailable(ManagedPythonWorker worker) {
+        publishAvailable(worker);
+    }
+
+    private void publishAvailable(ManagedPythonWorker worker) {
         WorkerSlot slot = slotFor(worker.workerId());
-        if (!slot.isCurrent(worker) || !worker.isReady()) return;
+        if (!slot.isCurrent(worker) || !worker.isRunning()) return;
         if (!accepting.get() && initialDecision.getCount() == 0) {
             worker.beginDrain(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.shutdownTimeoutMs()));
             return;
         }
-        availableWorkers.offer(worker);
+        if (!worker.tryMarkAvailabilityPublished()) return;
+        if (!availableWorkers.offer(worker)) {
+            worker.clearAvailabilityPublication();
+            worker.fail(new IOException("Managed Python Runtime availability queue rejected a worker token"));
+        }
     }
 
     @Override
     public void onUnhealthy(ManagedPythonWorker worker, Exception failure) {
+        worker.clearAvailabilityPublication();
         availableWorkers.remove(worker);
         WorkerSlot slot = slotFor(worker.workerId());
         if (slot.markUnhealthy(worker)) {
@@ -253,7 +276,10 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
 
         List<ManagedPythonWorker> workers = currentWorkers();
         availableWorkers.clear();
-        for (ManagedPythonWorker worker : workers) worker.beginDrain(deadline);
+        for (ManagedPythonWorker worker : workers) {
+            worker.clearAvailabilityPublication();
+            worker.beginDrain(deadline);
+        }
         awaitLatch(dispatcherStopped, deadline);
         for (ManagedPythonWorker worker : workers) worker.awaitStopped(deadline);
         TimeoutException timeout = new TimeoutException(
@@ -459,7 +485,7 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
                                     currentHealthy = true;
                                 }
                                 healthyWorkers.incrementAndGet();
-                                availableWorkers.offer(worker);
+                                publishAvailable(worker);
                             }
                         }
                         if (lateDuringShutdown) {
