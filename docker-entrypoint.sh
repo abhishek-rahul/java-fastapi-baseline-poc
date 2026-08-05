@@ -17,6 +17,13 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+run_java() {
+    if [ "$MODE" = "MANAGED_RUNTIME" ]; then
+        exec java "$@"
+    fi
+    java "$@"
+}
+
 case "$MODE" in
     HTTP)
         echo "Starting baseline TCP server: host=127.0.0.1, port=8000, uvicornWorkers=$UVICORN_WORKERS"
@@ -66,16 +73,16 @@ fi
 cd /app/java-client
 case "$RUN_TARGET" in
     APPLICATION)
-        java -jar /app/java-client.jar "$MODE"
+        run_java -jar /app/java-client.jar "$MODE"
         ;;
     E2E)
-        java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE"
+        run_java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE"
         ;;
     E2E_SHUTDOWN_DRAIN)
-        java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE" SHUTDOWN_DRAIN
+        run_java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE" SHUTDOWN_DRAIN
         ;;
     E2E_SHUTDOWN_TIMEOUT)
-        java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE" SHUTDOWN_TIMEOUT
+        run_java -cp /app/java-client.jar com.example.baseline.e2e.Phase1E2ERunner "$MODE" SHUTDOWN_TIMEOUT
         ;;
     PHASE2_E2E)
         SCENARIO="${3:-}"
@@ -83,7 +90,7 @@ case "$RUN_TARGET" in
             echo "PHASE2_E2E requires: MANAGED_RUNTIME PHASE2_E2E <SCENARIO>." >&2
             exit 2
         fi
-        java -cp /app/java-client.jar com.example.baseline.e2e.Phase2E2ERunner "$SCENARIO"
+        run_java -cp /app/java-client.jar com.example.baseline.e2e.Phase2E2ERunner "$SCENARIO"
         ;;
     PHASE3_E2E)
         SCENARIO="${3:-}"
@@ -91,11 +98,20 @@ case "$RUN_TARGET" in
             echo "PHASE3_E2E requires: MANAGED_RUNTIME PHASE3_E2E <SCENARIO>." >&2
             exit 2
         fi
-        java -Dorg.slf4j.simpleLogger.defaultLogLevel=debug \
+        run_java -Dorg.slf4j.simpleLogger.defaultLogLevel=debug \
             -cp /app/java-client.jar com.example.baseline.e2e.Phase3E2ERunner "$SCENARIO"
         ;;
+    PHASE4_E2E)
+        SCENARIO="${3:-}"
+        if [ "$MODE" != "MANAGED_RUNTIME" ] || [ -z "$SCENARIO" ]; then
+            echo "PHASE4_E2E requires: MANAGED_RUNTIME PHASE4_E2E <SCENARIO>." >&2
+            exit 2
+        fi
+        run_java -Dorg.slf4j.simpleLogger.defaultLogLevel=info \
+            -cp /app/java-client.jar com.example.baseline.e2e.Phase4E2ERunner "$SCENARIO"
+        ;;
     *)
-        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION, E2E, E2E_SHUTDOWN_DRAIN, E2E_SHUTDOWN_TIMEOUT, PHASE2_E2E, or PHASE3_E2E." >&2
+        echo "Unsupported run target '$RUN_TARGET'. Expected APPLICATION, E2E, E2E_SHUTDOWN_DRAIN, E2E_SHUTDOWN_TIMEOUT, PHASE2_E2E, PHASE3_E2E, or PHASE4_E2E." >&2
         exit 2
         ;;
 esac

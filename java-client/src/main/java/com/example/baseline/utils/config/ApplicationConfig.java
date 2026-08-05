@@ -89,8 +89,36 @@ public record ApplicationConfig(
             @JsonProperty("restart-initial-backoff-ms") long restartInitialBackoffMs,
             @JsonProperty("restart-maximum-backoff-ms") long restartMaximumBackoffMs,
             @JsonProperty("restart-max-attempts") int restartMaxAttempts,
-            @JsonProperty("restart-window-ms") long restartWindowMs
+            @JsonProperty("restart-window-ms") long restartWindowMs,
+            @JsonProperty("health-check-enabled") boolean healthCheckEnabled,
+            @JsonProperty("health-check-interval-ms") long healthCheckIntervalMs,
+            @JsonProperty("health-check-timeout-ms") long healthCheckTimeoutMs,
+            @JsonProperty("health-check-startup-grace-ms") long healthCheckStartupGraceMs
     ) {
+        public ManagedPythonRuntimeConfig(
+                String pythonExecutable,
+                String applicationDirectory,
+                String udsDirectory,
+                int workerCount,
+                int maxInFlightPerWorker,
+                int queueCapacity,
+                long queueTimeoutMs,
+                int maxFrameBytes,
+                long startupTimeoutMs,
+                long requestTimeoutMs,
+                long shutdownTimeoutMs,
+                boolean restartEnabled,
+                long restartInitialBackoffMs,
+                long restartMaximumBackoffMs,
+                int restartMaxAttempts,
+                long restartWindowMs) {
+            this(pythonExecutable, applicationDirectory, udsDirectory, workerCount,
+                    maxInFlightPerWorker, queueCapacity, queueTimeoutMs, maxFrameBytes,
+                    startupTimeoutMs, requestTimeoutMs, shutdownTimeoutMs, restartEnabled,
+                    restartInitialBackoffMs, restartMaximumBackoffMs, restartMaxAttempts,
+                    restartWindowMs, true, 5_000, 1_000, 5_000);
+        }
+
         public void validate() {
             requireText(pythonExecutable, "managed-python-runtime.python-executable");
             requireText(applicationDirectory, "managed-python-runtime.application-directory");
@@ -103,18 +131,27 @@ public record ApplicationConfig(
                 throw new IllegalArgumentException(
                         "managed-python-runtime.max-in-flight-per-worker must be between 1 and 64");
             }
-            if (queueCapacity <= 0) {
+            if (queueCapacity < 1 || queueCapacity > 10_000) {
                 throw new IllegalArgumentException(
-                        "managed-python-runtime.queue-capacity must be greater than zero");
+                        "managed-python-runtime.queue-capacity must be between 1 and 10000");
             }
-            requirePositive(queueTimeoutMs, "managed-python-runtime.queue-timeout-ms");
-            if (maxFrameBytes < 1024) {
+            long totalCapacity = Math.multiplyExact((long) workerCount, maxInFlightPerWorker);
+            if (totalCapacity > 4_096) {
                 throw new IllegalArgumentException(
-                        "managed-python-runtime.max-frame-bytes must be at least 1024");
+                        "managed-python-runtime total in-flight capacity must not exceed 4096");
             }
-            requirePositive(startupTimeoutMs, "managed-python-runtime.startup-timeout-ms");
-            requirePositive(requestTimeoutMs, "managed-python-runtime.request-timeout-ms");
-            requirePositive(shutdownTimeoutMs, "managed-python-runtime.shutdown-timeout-ms");
+            requireBoundedPositive(queueTimeoutMs, 3_600_000,
+                    "managed-python-runtime.queue-timeout-ms");
+            if (maxFrameBytes < 1024 || maxFrameBytes > 16_777_216) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.max-frame-bytes must be between 1024 and 16777216");
+            }
+            requireBoundedPositive(startupTimeoutMs, 3_600_000,
+                    "managed-python-runtime.startup-timeout-ms");
+            requireBoundedPositive(requestTimeoutMs, 3_600_000,
+                    "managed-python-runtime.request-timeout-ms");
+            requireBoundedPositive(shutdownTimeoutMs, 3_600_000,
+                    "managed-python-runtime.shutdown-timeout-ms");
             if (restartInitialBackoffMs < 0) {
                 throw new IllegalArgumentException(
                         "managed-python-runtime.restart-initial-backoff-ms must not be negative");
@@ -131,7 +168,32 @@ public record ApplicationConfig(
                 throw new IllegalArgumentException(
                         "managed-python-runtime.restart-max-attempts must not be negative");
             }
-            requirePositive(restartWindowMs, "managed-python-runtime.restart-window-ms");
+            if (restartMaxAttempts > 1_000) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.restart-max-attempts must not exceed 1000");
+            }
+            requireBoundedNonNegative(restartInitialBackoffMs, 3_600_000,
+                    "managed-python-runtime.restart-initial-backoff-ms");
+            requireBoundedNonNegative(restartMaximumBackoffMs, 3_600_000,
+                    "managed-python-runtime.restart-maximum-backoff-ms");
+            requireBoundedPositive(restartWindowMs, 86_400_000,
+                    "managed-python-runtime.restart-window-ms");
+            if (healthCheckIntervalMs < 100 || healthCheckIntervalMs > 3_600_000) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.health-check-interval-ms must be between 100 and 3600000");
+            }
+            if (healthCheckTimeoutMs < 50 || healthCheckTimeoutMs > 300_000) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.health-check-timeout-ms must be between 50 and 300000");
+            }
+            if (healthCheckEnabled && healthCheckTimeoutMs >= healthCheckIntervalMs) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.health-check-timeout-ms must be less than health-check-interval-ms");
+            }
+            if (healthCheckStartupGraceMs < 0 || healthCheckStartupGraceMs > 3_600_000) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.health-check-startup-grace-ms must be between 0 and 3600000");
+            }
         }
 
         public ManagedPythonRuntimeConfig normalized() {
@@ -152,7 +214,11 @@ public record ApplicationConfig(
                     restartInitialBackoffMs,
                     restartMaximumBackoffMs,
                     restartMaxAttempts,
-                    restartWindowMs
+                    restartWindowMs,
+                    healthCheckEnabled,
+                    healthCheckIntervalMs,
+                    healthCheckTimeoutMs,
+                    healthCheckStartupGraceMs
             );
         }
     }
@@ -167,5 +233,17 @@ public record ApplicationConfig(
 
     private static void requirePositive(long value, String property) {
         if (value <= 0) throw new IllegalArgumentException(property + " must be greater than zero");
+    }
+
+    private static void requireBoundedPositive(long value, long maximum, String property) {
+        if (value <= 0 || value > maximum) {
+            throw new IllegalArgumentException(property + " must be between 1 and " + maximum);
+        }
+    }
+
+    private static void requireBoundedNonNegative(long value, long maximum, String property) {
+        if (value < 0 || value > maximum) {
+            throw new IllegalArgumentException(property + " must be between 0 and " + maximum);
+        }
     }
 }

@@ -81,8 +81,6 @@ public final class BaselineApplication {
             Instant batchEndTime = Instant.now();
             double batchDurationMs = (batchEndNs - batchStartNs) / 1_000_000.0;
 
-            //results.forEach(BaselineApplication::printResult);
-
             double averageObservedMs = results.stream()
                     .mapToDouble(CallResult::javaObservedTimeMs)
                     .average()
@@ -114,18 +112,4 @@ public final class BaselineApplication {
         }
     }
 
-    private static void printResult(CallResult result) {
-        System.out.println();
-        System.out.printf("Request ID               : %s%n", result.requestId());
-        System.out.printf("Java worker thread       : %s%n", result.javaWorkerThread());
-        System.out.printf("Java start time          : %s%n", result.javaStartTime());
-        System.out.printf("Java end time            : %s%n", result.javaEndTime());
-        System.out.printf("Java observed time ms    : %.3f%n", result.javaObservedTimeMs());
-        System.out.printf("HTTP status              : %d%n", result.httpStatus());
-        System.out.printf("Python start time        : %s%n", result.response().pythonStartTime());
-        System.out.printf("Python end time          : %s%n", result.response().pythonEndTime());
-        System.out.printf("Python execution time ms : %.3f%n", result.response().pythonExecutionTimeMs());
-        System.out.printf("Python event-loop thread : %s%n", result.response().eventLoopThread());
-        System.out.printf("Processed message        : %s%n", result.response().processedMessage());
-    }
 }
