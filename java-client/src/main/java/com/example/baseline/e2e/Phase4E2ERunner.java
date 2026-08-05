@@ -43,6 +43,7 @@ public final class Phase4E2ERunner {
             case "STUCK_IDLE" -> stuckIdle(base);
             case "STALE_PONG" -> stalePong(base);
             case "BUSY_HEALTH_POLICY" -> busyHealthPolicy(base);
+            case "HEALTH_TIMEOUT_WITH_ACTIVE" -> healthTimeoutWithActive(base);
             case "DEGRADED_VISIBILITY" -> degradedVisibility(base);
             case "RESTART_EXHAUSTION_VISIBILITY" -> restartExhaustionVisibility(base);
             case "PARTIAL_STARTUP" -> partialStartup(base);
@@ -155,6 +156,55 @@ public final class Phase4E2ERunner {
             caller.shutdownNow();
             caller.awaitTermination(2, TimeUnit.SECONDS);
             shutdownAndVerify(config, pids);
+        }
+    }
+
+    private static void healthTimeoutWithActive(ApplicationConfig base) throws Exception {
+        try (PythonFixture fixture = PythonFixture.delayedPong()) {
+            ApplicationConfig config = withPythonExecutable(
+                    configured(base, 1, 1, 300, 200, 0, 3, 5_000), fixture.wrapper().toString());
+            ExecutorService caller = Executors.newSingleThreadExecutor();
+            Set<Long> allPids = new HashSet<>();
+            try {
+                PythonCallUtil.initialize(PythonCallMode.MANAGED_RUNTIME, config);
+                long oldPid = onlyPid(waitForWorkerCount(1, 5_000));
+                allPids.add(oldPid);
+                waitUntil(() -> snapshot().metrics().healthChecksSent() >= 1, 2_000,
+                        "Delayed PONG fixture did not receive a transmitted PING");
+
+                CompletableFuture<ProcessResponse> active = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return request(config, "active-after-ping", 10);
+                    } catch (Exception failure) {
+                        throw new CompletionException(failure);
+                    }
+                }, caller);
+                waitUntil(() -> snapshot().totalInFlight() == 1, 1_000,
+                        "Business request was not assigned after PING transmission");
+                waitUntil(() -> snapshot().metrics().healthChecksFailed() >= 1, 2_000,
+                        "Later business activity suppressed the outstanding PONG timeout");
+                Throwable activeFailure;
+                try {
+                    active.get(2, TimeUnit.SECONDS);
+                    throw new IllegalStateException("Active request unexpectedly survived its worker health timeout");
+                } catch (java.util.concurrent.ExecutionException expected) {
+                    activeFailure = expected.getCause();
+                }
+                require(activeFailure != null,
+                        "Active request did not receive a deterministic worker failure");
+                waitUntil(() -> snapshot().fullyReady() && !workerPids().contains(oldPid), 6_000,
+                        "Health-timeout replacement did not become ready");
+                Set<Long> replacement = workerPids();
+                allPids.addAll(replacement);
+                request(config, "after-active-health-timeout", 10);
+                System.out.printf("Phase 4 HEALTH_TIMEOUT_WITH_ACTIVE passed: oldPid=%d, "
+                                + "replacementPid=%s, healthFailures=%d, activeFutureTerminal=true%n",
+                        oldPid, replacement, snapshot().metrics().healthChecksFailed());
+            } finally {
+                caller.shutdownNow();
+                caller.awaitTermination(2, TimeUnit.SECONDS);
+                shutdownAndVerify(config, allPids);
+            }
         }
     }
 

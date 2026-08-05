@@ -511,3 +511,43 @@ Environment: Windows 10 host with Docker Desktop Linux containers; final image u
 ## Final statement
 
 Phase 4 complete
+
+---
+
+## Focused Phase 4 health and shutdown deadline corrections
+
+Date: 2026-08-06
+
+- PONG timeout ownership now begins only after the complete PING frame has been written to the worker UDS. A queued health item has no response deadline.
+- An already-transmitted PING remains timeout-eligible even when business work is assigned afterward. The idle requirement applies only when creating a new health check.
+- Pool shutdown now reserves a bounded tail of its single absolute deadline for forced process termination and thread/output joins. Worker cleanup no longer creates a separate 250 ms join deadline, and forced termination is reported exactly once per generation.
+- Added the real-process `HEALTH_TIMEOUT_WITH_ACTIVE` Phase 4 scenario; no production failure-injection hook or unit test was added.
+
+### Commands and observed results
+
+- `cd java-client; mvn -DskipTests clean package`
+  Result: PASS - 23 main sources and 3 existing test sources compiled; shaded JAR built; final total time 9.161 seconds.
+- `cd java-client; mvn test`
+  Result: PASS - 8 existing tests, 0 failures, 0 errors, 0 skipped; final total time 4.699 seconds.
+- `docker build -t java-fastapi-runtime-poc .`
+  Result: PASS - final focused source image built successfully with exit code 0.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE4_E2E HEALTH_TIMEOUT_WITH_ACTIVE`
+  Result: PASS - PING was transmitted before business assignment; the delayed PONG timed out while one business request was active, that future became terminal, PID 27 was removed, replacement PID 43 became ready and served subsequent work, and final cleanup reported `cleanupFailures=0`.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE4_E2E IDLE_HEALTH` and `BUSY_HEALTH_POLICY`
+  Result: PASS - three normal PING/PONG cycles succeeded without consuming business capacity; no new PING was created during active work and health resumed after idle.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE4_E2E HEALTH_SHUTDOWN_RACE`
+  Result: PASS - shutdown with an outstanding delayed health response completed in 998 ms with no remaining managed thread, worker process, socket, or runtime directory.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E SHUTDOWN`
+  Result: PASS - six active requests drained, four queued requests failed, new calls were rejected, all futures became terminal, and both worker PIDs were removed in 372 ms.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE3_E2E SHUTDOWN_TIMEOUT`
+  Result: PASS - three consecutive final-image runs made all six active futures terminal in 279, 280, and 272 ms against one 500 ms deadline. Every run reported two forced terminations, zero cleanup failures, and removal of both PIDs and owned UDS resources.
+- `docker run --rm java-fastapi-runtime-poc HTTP E2E`
+  Result: PASS - unchanged OkHttp/Uvicorn lifecycle, validation/non-2xx, and concurrent-caller behavior passed.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E`
+  Result: PASS - four real Java-owned CPython workers passed the standard UDS/ASGI lifecycle and concurrent-caller regression; shutdown reported zero cleanup failures.
+- `docker ps -a --filter ancestor=java-fastapi-runtime-poc --format "{{.ID}} {{.Status}} {{.Names}}"`
+  Result: PASS - output was empty; no test container remained.
+
+### Focused acceptance result
+
+PASS - PONG timing is transmission-based, later business activity cannot suppress an outstanding health timeout, and all forced-cleanup waits use the one pool shutdown deadline. HTTP and FastAPI application code remain unchanged.

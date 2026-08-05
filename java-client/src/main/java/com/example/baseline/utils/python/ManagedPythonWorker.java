@@ -101,7 +101,16 @@ final class ManagedPythonWorker {
     private record HealthPing(String healthCheckId, int generation, long workerPid) implements OutboundItem {
     }
 
-    private record OutstandingHealth(String healthCheckId, long startedAtNs, long deadlineNs) {
+    private record OutstandingHealth(
+            String healthCheckId,
+            HealthTransmissionState transmissionState,
+            long transmittedAtNs,
+            long deadlineNs) {
+    }
+
+    private enum HealthTransmissionState {
+        QUEUED,
+        TRANSMITTED
     }
 
     private enum WorkerState {
@@ -132,6 +141,7 @@ final class ManagedPythonWorker {
     private final Map<String, Assignment> activeAssignments = new HashMap<>();
     private final AtomicBoolean failurePublished = new AtomicBoolean();
     private final AtomicBoolean cleanupStarted = new AtomicBoolean();
+    private final AtomicBoolean forcedTerminationPublished = new AtomicBoolean();
     private final CountDownLatch shutdownAcknowledged = new CountDownLatch(1);
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final Thread writerThread;
@@ -140,6 +150,7 @@ final class ManagedPythonWorker {
     private final AtomicLong healthSequence = new AtomicLong();
     private volatile WorkerState state = WorkerState.RUNNING;
     private volatile long shutdownDeadlineNs = Long.MAX_VALUE;
+    private volatile long cleanupDeadlineNs = Long.MAX_VALUE;
     private int inFlightCount;
     private boolean availabilityPublished;
     private OutstandingHealth outstandingHealth;
@@ -242,7 +253,7 @@ final class ManagedPythonWorker {
             return worker;
         } catch (Exception failure) {
             closeQuietly(channel);
-            stopProcess(process, config.shutdownTimeoutMs());
+            stopProcess(process, startupDeadlineNs);
             if (outputCapture != null) outputCapture.join(startupDeadlineNs);
             deleteSocket(socketPath);
             throw failure;
@@ -325,19 +336,21 @@ final class ManagedPythonWorker {
         OutstandingHealth timedOut = null;
         HealthPing ping = null;
         synchronized (stateLock) {
-            if (state != WorkerState.RUNNING || inFlightCount != 0) return;
+            if (state != WorkerState.RUNNING) return;
             if (outstandingHealth != null) {
-                if (nowNs >= outstandingHealth.deadlineNs()) {
+                if (outstandingHealth.transmissionState() == HealthTransmissionState.TRANSMITTED
+                        && nowNs >= outstandingHealth.deadlineNs()) {
                     timedOut = outstandingHealth;
                     outstandingHealth = null;
                 }
-            } else if (nowNs - startedAtNs >= TimeUnit.MILLISECONDS.toNanos(
+            } else if (inFlightCount == 0
+                    && nowNs - startedAtNs >= TimeUnit.MILLISECONDS.toNanos(
                     config.healthCheckStartupGraceMs())
                     && nowNs - lastResponsiveNs >= TimeUnit.MILLISECONDS.toNanos(
                     config.healthCheckIntervalMs())) {
                 String id = workerId + "-g" + generation + "-h" + healthSequence.incrementAndGet();
                 outstandingHealth = new OutstandingHealth(
-                        id, nowNs, nowNs + TimeUnit.MILLISECONDS.toNanos(config.healthCheckTimeoutMs()));
+                        id, HealthTransmissionState.QUEUED, 0, Long.MAX_VALUE);
                 ping = new HealthPing(id, generation, workerPid);
             }
         }
@@ -431,7 +444,7 @@ final class ManagedPythonWorker {
     void beginDrain(long deadlineNs) {
         synchronized (stateLock) {
             if (state == WorkerState.STOPPED || state == WorkerState.UNHEALTHY) return;
-            shutdownDeadlineNs = deadlineNs;
+            shutdownDeadlineNs = Math.min(shutdownDeadlineNs, deadlineNs);
             state = WorkerState.DRAINING;
             availabilityPublished = false;
             outstandingHealth = null;
@@ -471,9 +484,15 @@ final class ManagedPythonWorker {
         markUnhealthy(ManagedPythonFailureCategory.PROTOCOL_CORRUPTION, failure);
     }
 
-    void forceStop(Exception failure) {
+    void forceStop(Exception failure, long deadlineNs) {
+        initiateForceStop(failure, deadlineNs);
+        finishForceStop(deadlineNs);
+    }
+
+    void initiateForceStop(Exception failure, long deadlineNs) {
         List<Assignment> assignments;
         synchronized (stateLock) {
+            cleanupDeadlineNs = Math.min(cleanupDeadlineNs, deadlineNs);
             if (state != WorkerState.STOPPED) state = WorkerState.STOPPED;
             availabilityPublished = false;
             assignments = drainAssignmentsLocked();
@@ -481,7 +500,13 @@ final class ManagedPythonWorker {
         outboundQueue.clear();
         completeAllExceptionally(assignments, failure, ManagedPythonFailureCategory.SHUTDOWN_TIMEOUT);
         writerThread.interrupt();
-        cleanup(true, System.nanoTime());
+        closeQuietly(channel);
+        forceTerminateProcess();
+    }
+
+    void finishForceStop(long deadlineNs) {
+        cleanup(true, deadlineNs);
+        awaitStopped(deadlineNs);
     }
 
     boolean isStopped() {
@@ -591,7 +616,8 @@ final class ManagedPythonWorker {
     private void transmitHealth(HealthPing ping) {
         synchronized (stateLock) {
             if (state != WorkerState.RUNNING || outstandingHealth == null
-                    || !outstandingHealth.healthCheckId().equals(ping.healthCheckId())) return;
+                    || !outstandingHealth.healthCheckId().equals(ping.healthCheckId())
+                    || outstandingHealth.transmissionState() != HealthTransmissionState.QUEUED) return;
         }
         try {
             PythonRuntimeProtocol.writeFrame(channel, Map.of(
@@ -600,9 +626,21 @@ final class ManagedPythonWorker {
                     "healthCheckId", ping.healthCheckId(),
                     "workerGeneration", ping.generation(),
                     "expectedWorkerPid", ping.workerPid()), new byte[0], config.maxFrameBytes());
+            long transmittedAtNs = System.nanoTime();
+            synchronized (stateLock) {
+                if (state == WorkerState.RUNNING && outstandingHealth != null
+                        && outstandingHealth.healthCheckId().equals(ping.healthCheckId())
+                        && outstandingHealth.transmissionState() == HealthTransmissionState.QUEUED) {
+                    outstandingHealth = new OutstandingHealth(
+                            ping.healthCheckId(),
+                            HealthTransmissionState.TRANSMITTED,
+                            transmittedAtNs,
+                            transmittedAtNs + TimeUnit.MILLISECONDS.toNanos(config.healthCheckTimeoutMs()));
+                }
+            }
             listener.onHealthCheckSent(this, ping.healthCheckId());
             LOGGER.debug("event=managed_python_health_ping workerId={} generation={} pid={} healthCheckId={} timeNs={}",
-                    workerId, generation, workerPid, ping.healthCheckId(), System.nanoTime());
+                    workerId, generation, workerPid, ping.healthCheckId(), transmittedAtNs);
         } catch (Exception failure) {
             markUnhealthy(ManagedPythonFailureCategory.SOCKET_WRITE_FAILURE,
                     asException("Managed Python worker health transmission failed", failure));
@@ -723,7 +761,9 @@ final class ManagedPythonWorker {
                 invalidCorrelation = true;
                 latency = 0;
             } else {
-                latency = Math.max(0, System.nanoTime() - outstandingHealth.startedAtNs());
+                latency = outstandingHealth.transmissionState() == HealthTransmissionState.TRANSMITTED
+                        ? Math.max(0, System.nanoTime() - outstandingHealth.transmittedAtNs())
+                        : 0;
                 outstandingHealth = null;
                 lastHealthLatencyNanos = latency;
                 updateResponsiveLocked();
@@ -857,28 +897,25 @@ final class ManagedPythonWorker {
         try {
             if (process.isAlive()) {
                 process.destroy();
-                long gracefulWaitNs = remainingNanos(deadlineNs) / 2;
+                long gracefulWaitNs = remainingNanos(effectiveCleanupDeadline(deadlineNs)) / 2;
                 if (gracefulWaitNs > 0) process.waitFor(gracefulWaitNs, TimeUnit.NANOSECONDS);
             }
             if (process.isAlive()) {
-                LOGGER.warn("event=managed_python_worker_force_terminated workerId={} generation={} pid={}",
-                        workerId, generation, workerPid);
-                listener.onForcedTermination(this);
-                process.destroyForcibly();
-                long remaining = remainingNanos(deadlineNs);
+                forceTerminateProcess();
+                long remaining = remainingNanos(effectiveCleanupDeadline(deadlineNs));
                 if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
             }
         } catch (InterruptedException exception) {
             interrupted = true;
-            if (process.isAlive()) process.destroyForcibly();
+            forceTerminateProcess();
             try {
-                long remaining = remainingNanos(deadlineNs);
+                long remaining = remainingNanos(effectiveCleanupDeadline(deadlineNs));
                 if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
             } catch (InterruptedException repeated) {
                 // Cleanup below still unblocks the slot; interrupt status is restored afterward.
             }
         } finally {
-            finishCleanup();
+            finishCleanup(deadlineNs);
             if (interrupted) Thread.currentThread().interrupt();
         }
     }
@@ -888,26 +925,25 @@ final class ManagedPythonWorker {
         closeQuietly(channel);
         try {
             if (process.isAlive()) {
-                if (force) process.destroyForcibly();
+                if (force) forceTerminateProcess();
                 else process.destroy();
-                long remaining = remainingNanos(deadlineNs);
+                long remaining = remainingNanos(effectiveCleanupDeadline(deadlineNs));
                 if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
                 if (process.isAlive()) {
-                    listener.onForcedTermination(this);
-                    process.destroyForcibly();
+                    forceTerminateProcess();
                 }
             }
         } catch (InterruptedException exception) {
-            process.destroyForcibly();
+            forceTerminateProcess();
             Thread.currentThread().interrupt();
         } finally {
-            finishCleanup();
+            finishCleanup(deadlineNs);
         }
     }
 
-    private void finishCleanup() {
+    private void finishCleanup(long deadlineNs) {
         deleteSocket(socketPath);
-        outputCapture.join(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(250));
+        outputCapture.join(effectiveCleanupDeadline(deadlineNs));
         synchronized (stateLock) {
             state = WorkerState.STOPPED;
             availabilityPublished = false;
@@ -922,6 +958,20 @@ final class ManagedPythonWorker {
         }
         LOGGER.info("event=managed_python_worker_stopped workerId={} generation={} pid={} socketRemoved={}",
                 workerId, generation, workerPid, !Files.exists(socketPath));
+    }
+
+    private void forceTerminateProcess() {
+        if (!process.isAlive()) return;
+        if (forcedTerminationPublished.compareAndSet(false, true)) {
+            LOGGER.warn("event=managed_python_worker_force_terminated workerId={} generation={} pid={}",
+                    workerId, generation, workerPid);
+            listener.onForcedTermination(this);
+        }
+        process.destroyForcibly();
+    }
+
+    private long effectiveCleanupDeadline(long candidateDeadlineNs) {
+        return Math.min(candidateDeadlineNs, cleanupDeadlineNs);
     }
 
     @SuppressWarnings("unchecked")
@@ -1035,12 +1085,18 @@ final class ManagedPythonWorker {
                 : new IOException(message, failure);
     }
 
-    private static void stopProcess(Process process, long timeoutMs) {
+    private static void stopProcess(Process process, long deadlineNs) {
         if (process == null) return;
         try {
-            if (process.isAlive() && !process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+            long remaining = remainingNanos(deadlineNs);
+            if (process.isAlive() && (remaining <= 0
+                    || !process.waitFor(remaining, TimeUnit.NANOSECONDS))) {
                 process.destroy();
-                if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) process.destroyForcibly();
+                remaining = remainingNanos(deadlineNs);
+                if (process.isAlive() && (remaining <= 0
+                        || !process.waitFor(remaining, TimeUnit.NANOSECONDS))) {
+                    process.destroyForcibly();
+                }
             }
         } catch (InterruptedException exception) {
             process.destroyForcibly();

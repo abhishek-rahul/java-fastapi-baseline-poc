@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.LongAdder;
 final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWorker.Listener {
     private static final Logger LOGGER = LoggerFactory.getLogger(ManagedPythonRuntime.class);
     private static final int MAX_FAILURE_MESSAGE = 512;
+    private static final long MAX_FORCED_CLEANUP_RESERVE_MILLIS = 250;
     private enum PoolState {
         STARTING,
         RUNNING,
@@ -60,6 +61,7 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
     private final Object dispatchStateLock = new Object();
     private volatile PoolState state = PoolState.STARTING;
     private volatile long initialStartupDeadlineNs;
+    private volatile long shutdownDeadlineNs = Long.MAX_VALUE;
     private Thread dispatcherThread;
     private final long createdAtNs = System.nanoTime();
 
@@ -279,7 +281,7 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
         WorkerSlot slot = slotFor(worker.workerId());
         if (!slot.isCurrent(worker) || !worker.isRunning()) return;
         if (!accepting.get() && initialDecision.getCount() == 0) {
-            worker.beginDrain(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.shutdownTimeoutMs()));
+            worker.beginDrain(shutdownDeadlineNs);
             return;
         }
         if (!worker.tryMarkAvailabilityPublished()) return;
@@ -351,13 +353,21 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
     public void onCleanupFailure(ManagedPythonWorker worker, String message, Exception failure) {
         metrics.cleanupFailures.increment();
         recordFailure(ManagedPythonFailureCategory.CLEANUP_FAILURE, worker, message, failure);
+        LOGGER.error("event=managed_python_cleanup_failed workerId={} generation={} pid={} message={} failure={}",
+                worker.workerId(), worker.generation(), worker.pid(), message, boundedMessage(failure));
     }
 
     @Override
     public void close() {
         if (!closeStarted.compareAndSet(false, true)) return;
         long shutdownStarted = System.nanoTime();
-        long deadline = shutdownStarted + TimeUnit.MILLISECONDS.toNanos(config.shutdownTimeoutMs());
+        long shutdownTimeoutNs = TimeUnit.MILLISECONDS.toNanos(config.shutdownTimeoutMs());
+        long deadline = shutdownStarted + shutdownTimeoutNs;
+        long forcedCleanupReserveNs = Math.min(
+                TimeUnit.MILLISECONDS.toNanos(MAX_FORCED_CLEANUP_RESERVE_MILLIS),
+                shutdownTimeoutNs / 2);
+        long drainDeadline = deadline - forcedCleanupReserveNs;
+        shutdownDeadlineNs = deadline;
         LOGGER.info("event=managed_python_pool_shutdown_started poolState={} queueDepth={} healthyWorkers={}",
                 state, admissionQueue.size(), healthyWorkers.get());
         synchronized (dispatchStateLock) {
@@ -379,19 +389,23 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
         availableWorkers.clear();
         for (ManagedPythonWorker worker : workers) {
             worker.clearAvailabilityPublication();
-            worker.beginDrain(deadline);
+            worker.beginDrain(drainDeadline);
         }
-        awaitLatch(dispatcherStopped, deadline);
-        for (ManagedPythonWorker worker : workers) worker.awaitStopped(deadline);
+        awaitLatch(dispatcherStopped, drainDeadline);
+        for (ManagedPythonWorker worker : workers) worker.awaitStopped(drainDeadline);
         TimeoutException timeout = new TimeoutException(
                 "Managed Python Runtime pool exceeded the common shutdown timeout");
+        List<ManagedPythonWorker> forcedWorkers = new ArrayList<>();
         for (ManagedPythonWorker worker : workers) {
             if (!worker.isStopped()) {
                 recordFailure(ManagedPythonFailureCategory.SHUTDOWN_TIMEOUT, worker,
                         "Worker exceeded the common shutdown deadline", timeout);
-                worker.forceStop(timeout);
+                forcedWorkers.add(worker);
+                worker.initiateForceStop(timeout, deadline);
             }
         }
+        for (ManagedPythonWorker worker : forcedWorkers) worker.finishForceStop(deadline);
+        for (ManagedPythonWorker worker : workers) worker.awaitStopped(deadline);
         for (WorkerSlot slot : slots) slot.interruptSupervisor();
         for (WorkerSlot slot : slots) slot.joinSupervisor(deadline);
         deleteRuntimeDirectory();
@@ -413,8 +427,12 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
         }
         initialDecision.countDown();
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.shutdownTimeoutMs());
+        shutdownDeadlineNs = deadline;
         stopHealthScheduler(deadline);
-        for (ManagedPythonWorker worker : currentWorkers()) worker.forceStop(shutdownFailure());
+        List<ManagedPythonWorker> workers = currentWorkers();
+        IllegalStateException failure = shutdownFailure();
+        for (ManagedPythonWorker worker : workers) worker.initiateForceStop(failure, deadline);
+        for (ManagedPythonWorker worker : workers) worker.finishForceStop(deadline);
         for (WorkerSlot slot : slots) slot.interruptSupervisor();
         for (WorkerSlot slot : slots) slot.joinSupervisor(deadline);
         deleteRuntimeDirectory();
@@ -816,7 +834,7 @@ final class ManagedPythonRuntime implements PythonCallExecutor, ManagedPythonWor
                             }
                         }
                         if (lateDuringShutdown) {
-                            worker.forceStop(shutdownFailure());
+                            worker.forceStop(shutdownFailure(), shutdownDeadlineNs);
                             return;
                         }
                         updatePoolState();
