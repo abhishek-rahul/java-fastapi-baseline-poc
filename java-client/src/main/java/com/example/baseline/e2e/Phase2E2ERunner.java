@@ -42,6 +42,7 @@ public final class Phase2E2ERunner {
             case "STARTUP_FAILURE" -> startupFailure(base);
             case "RESTART_EXHAUSTION" -> restartExhaustion(base);
             case "REQUEST_TIMEOUT" -> requestTimeout(base);
+            case "UNHEALTHY_FORCE_TERMINATION" -> unhealthyForceTermination(base);
             case "SHUTDOWN" -> shutdown(base);
             case "SHUTDOWN_TIMEOUT" -> shutdownTimeout(base);
             default -> throw new IllegalArgumentException("Unsupported Phase 2 E2E scenario: " + args[0]);
@@ -225,6 +226,48 @@ public final class Phase2E2ERunner {
             require(result.httpStatus() == 200, "Replacement was not usable after request timeout");
             System.out.printf("Phase 2 REQUEST_TIMEOUT passed: poisonedPid=%s, replacementPid=%s, "
                     + "timedOutRequestNotRetried=true%n", before, after);
+        } finally {
+            shutdownAndVerify(config, caller);
+        }
+    }
+
+    private static void unhealthyForceTermination(ApplicationConfig base) throws Exception {
+        ApplicationConfig config = withManaged(base, managed(base, 1, 4, 2_000, 300, 1_000, true, 2));
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            PythonCallUtil.initialize(PythonCallMode.MANAGED_RUNTIME, config);
+            Set<Long> before = waitForWorkerCount(1, 5_000);
+            long originalPid = before.iterator().next();
+            suspend(originalPid);
+
+            RestProcessingClient client = new RestProcessingClient(config.fastApi());
+            CompletableFuture<CallResult> timedOut = calls(
+                    client, caller, 1, 1_000, "unhealthy-force").get(0);
+            long terminationStart = System.nanoTime();
+            Outcome outcome = outcomes(List.of(timedOut), 3_000).get(0);
+            require(outcome.failure != null && messageChain(outcome.failure).contains("timed out"),
+                    "Suspended worker request did not fail with the deterministic timeout");
+            require(timedOut.isDone(), "Suspended worker request future was not terminal");
+
+            waitUntil(() -> !ProcessHandle.of(originalPid).map(ProcessHandle::isAlive).orElse(false),
+                    3_000, "Suspended unhealthy worker remained alive");
+            long terminationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - terminationStart);
+            require(terminationMs < config.managedPythonRuntime().shutdownTimeoutMs() + 1_000,
+                    "Unhealthy worker termination exceeded its bounded allowance: " + terminationMs);
+
+            Set<Long> after = waitForChangedPool(before, 1, 8_000);
+            long replacementPid = after.iterator().next();
+            require(replacementPid != originalPid, "Replacement reused the original worker PID");
+            CallResult replacementResult = client.process(
+                    new ProcessRequest("after-force-termination", "replacement", 10));
+            require(replacementResult.httpStatus() == 200,
+                    "Replacement worker did not handle a successful request");
+            verifySocketMissing(config, "worker-1-g1.sock");
+
+            System.out.printf("Phase 2 UNHEALTHY_FORCE_TERMINATION passed: originalPid=%d, "
+                            + "replacementPid=%d, suspended=true, forcedFallbackObserved=true, "
+                            + "terminationMs=%d, timedOutFutureTerminal=true, staleSocket=false%n",
+                    originalPid, replacementPid, terminationMs);
         } finally {
             shutdownAndVerify(config, caller);
         }
@@ -417,6 +460,13 @@ public final class Phase2E2ERunner {
         require(handle.destroyForcibly(), "Unable to forcibly terminate worker PID " + pid);
     }
 
+    private static void suspend(long pid) throws Exception {
+        Process signal = new ProcessBuilder(
+                "/bin/sh", "-c", "kill -STOP \"$1\"", "phase2-e2e", Long.toString(pid)).start();
+        require(signal.waitFor(2, TimeUnit.SECONDS), "Timed out suspending worker PID " + pid);
+        require(signal.exitValue() == 0, "Unable to suspend worker PID " + pid);
+    }
+
     private static void verifyPidsGone(Set<Long> pids, long timeoutMs) throws Exception {
         waitUntil(() -> pids.stream().noneMatch(pid ->
                         ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)),
@@ -438,6 +488,15 @@ public final class Phase2E2ERunner {
         try (var paths = Files.list(parent)) {
             require(paths.noneMatch(path -> path.getFileName().toString().startsWith("runtime-pool-")),
                     "Managed runtime directory was not removed from " + parent);
+        }
+    }
+
+    private static void verifySocketMissing(ApplicationConfig config, String socketName) throws Exception {
+        Path parent = Path.of(config.managedPythonRuntime().udsDirectory()).toAbsolutePath().normalize();
+        if (!Files.exists(parent)) return;
+        try (var paths = Files.walk(parent)) {
+            require(paths.noneMatch(path -> path.getFileName().toString().equals(socketName)),
+                    "Stale Managed Python worker socket remained: " + socketName);
         }
     }
 

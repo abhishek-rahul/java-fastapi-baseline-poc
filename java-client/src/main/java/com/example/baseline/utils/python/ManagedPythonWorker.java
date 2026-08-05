@@ -224,7 +224,13 @@ final class ManagedPythonWorker {
     }
 
     void awaitProcessExit() throws InterruptedException {
-        process.waitFor();
+        while (process.isAlive()) {
+            if (state == WorkerState.UNHEALTHY) {
+                terminateUnhealthyProcess();
+                return;
+            }
+            process.waitFor(100, TimeUnit.MILLISECONDS);
+        }
     }
 
     boolean awaitStopped(long deadlineNs) {
@@ -388,6 +394,44 @@ final class ManagedPythonWorker {
         }
     }
 
+    private void terminateUnhealthyProcess() {
+        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.shutdownTimeoutMs());
+        if (!cleanupStarted.compareAndSet(false, true)) {
+            awaitStopped(deadlineNs);
+            return;
+        }
+
+        boolean interrupted = false;
+        closeQuietly(channel);
+        try {
+            if (process.isAlive()) {
+                process.destroy();
+                long gracefulWaitNs = remainingNanos(deadlineNs) / 2;
+                if (gracefulWaitNs > 0) process.waitFor(gracefulWaitNs, TimeUnit.NANOSECONDS);
+            }
+            if (process.isAlive()) {
+                System.err.printf(
+                        "Managed Python worker force termination: workerId=%s, generation=%d, pid=%d%n",
+                        workerId, generation, workerPid);
+                process.destroyForcibly();
+                long remaining = remainingNanos(deadlineNs);
+                if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
+            }
+        } catch (InterruptedException exception) {
+            interrupted = true;
+            if (process.isAlive()) process.destroyForcibly();
+            try {
+                long remaining = remainingNanos(deadlineNs);
+                if (remaining > 0) process.waitFor(remaining, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException repeated) {
+                // Cleanup below still unblocks the slot; interrupt status is restored afterward.
+            }
+        } finally {
+            finishCleanup();
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
+
     private void cleanup(boolean force, long deadlineNs) {
         if (!cleanupStarted.compareAndSet(false, true)) return;
         closeQuietly(channel);
@@ -403,16 +447,20 @@ final class ManagedPythonWorker {
             process.destroyForcibly();
             Thread.currentThread().interrupt();
         } finally {
-            deleteSocket(socketPath);
-            synchronized (stateLock) {
-                state = WorkerState.STOPPED;
-            }
-            stopped.countDown();
+            finishCleanup();
+        }
+    }
+
+    private void finishCleanup() {
+        deleteSocket(socketPath);
+        synchronized (stateLock) {
+            state = WorkerState.STOPPED;
+        }
+        stopped.countDown();
             /* 
             System.out.printf("Managed Python worker stopped: workerId=%s, generation=%d, pid=%d, socketRemoved=%s%n",
                     workerId, generation, workerPid, !Files.exists(socketPath));
             */
-            }
     }
 
     @SuppressWarnings("unchecked")

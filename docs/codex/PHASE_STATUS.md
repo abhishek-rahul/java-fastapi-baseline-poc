@@ -220,3 +220,50 @@ Environment: Windows 10 host with Docker Linux containers; final image uses Java
 ## Final statement
 
 Phase 2 complete
+
+---
+
+## Focused Phase 2 unhealthy-worker termination fix
+
+Date: 2026-08-05
+
+- Root cause corrected: an unhealthy worker received `Process.destroy()`, but its slot supervisor then used an unbounded `Process.waitFor()`. A stopped or otherwise non-responsive CPython process could therefore prevent cleanup and replacement indefinitely.
+- `ManagedPythonWorker` now gives an unhealthy process a bounded graceful exit opportunity, escalates to `destroyForcibly()` when it remains alive, waits only within the remaining `shutdown-timeout-ms` budget, removes the generation socket, and releases the slot supervisor for replacement.
+- Added real-process scenario `UNHEALTHY_FORCE_TERMINATION`: one worker is suspended with `SIGSTOP`, its request times out, the graceful stop cannot complete, forced termination is observed, and a new generation handles a subsequent request.
+
+### Commands and observed results
+
+- `cd java-client; mvn -DskipTests clean package`
+  Result: PASS — 19 main sources and 3 existing test sources compiled for Java 17; shaded JAR built; total time 7.969 seconds.
+- `cd java-client; mvn test`
+  Result: PASS — 8 existing tests, 0 failures, 0 errors, 0 skipped.
+- `docker build --no-cache --progress=plain -t java-fastapi-runtime-poc .`
+  Result: PASS — exact corrected source built into the Java 17/Python 3.12 image in 95.1 seconds.
+- Initial `UNHEALTHY_FORCE_TERMINATION` run
+  Result: E2E harness portability failure — `/bin/kill` was absent in the Debian image. The harness was corrected to send the same real `SIGSTOP` through `/bin/sh`; production runtime code was not changed for this issue.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE2_E2E UNHEALTHY_FORCE_TERMINATION`
+  Result: PASS — suspended original PID 27 timed out, forced fallback was observed, termination completed in 877 ms against `shutdown-timeout-ms=1000`, replacement PID 43 served a successful request, the caller future was terminal, and `worker-1-g1.sock` was absent.
+- `docker run --rm java-fastapi-runtime-poc HTTP E2E`
+  Result: PASS — existing real OkHttp/Uvicorn E2E passed with four concurrent callers.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME E2E`
+  Result: PASS — existing real managed-runtime E2E passed with four concurrent callers.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE2_E2E IDLE_FAILURE`
+  Result: PASS — killed idle PID 34 was removed, replacement PID 60 restored four-worker capacity, and later work succeeded.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE2_E2E BUSY_FAILURE`
+  Result: PASS — killed busy PID 34 caused exactly one non-retried active failure, three other active calls succeeded, and replacement PID 63 restored the pool.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE2_E2E REQUEST_TIMEOUT`
+  Result: PASS — timed-out PID 28 was poisoned without retry, replacement PID 41 became ready, and a subsequent call succeeded.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE2_E2E RESTART_EXHAUSTION`
+  Result: PASS — generations used PIDs 28, 34, and 43; restart stopped after two attempts; unavailable work failed in 0 ms with no infinite restart.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE2_E2E SHUTDOWN`
+  Result: PASS — four active requests drained, four queued requests failed, new calls were rejected, every future was terminal, and PIDs 31, 32, 33, and 34 were removed in a 695 ms shutdown.
+- `docker run --rm java-fastapi-runtime-poc MANAGED_RUNTIME PHASE2_E2E SHUTDOWN_TIMEOUT`
+  Result: PASS — four over-time active requests failed deterministically, every future was terminal, and PIDs 33, 34, 35, and 36 were removed in 519 ms against one 500 ms common deadline.
+- `docker ps -a --filter ancestor=java-fastapi-runtime-poc --format "{{.ID}} {{.Status}} {{.Names}}"`
+  Result: PASS — output was empty; no E2E container remained.
+- `git diff --name-only -- python-fastapi/app python-fastapi/python_runtime java-client/src/main/java/com/example/baseline/utils/http java-client/src/main/java/com/example/baseline/client/RestProcessingClient.java java-client/src/main/java/com/example/baseline/BaselineApplication.java`
+  Result: PASS — output was empty; FastAPI application, Python runtime adapter, HTTP utility path, REST client, and application entry point were unchanged by this fix.
+
+### Focused acceptance result
+
+PASS — unhealthy-process termination is bounded, the active request completes exceptionally exactly once, slot replacement proceeds with a new PID, no caller future/process/socket/container is leaked, and all requested Phase 2 regressions pass. No Phase 3 work was started.

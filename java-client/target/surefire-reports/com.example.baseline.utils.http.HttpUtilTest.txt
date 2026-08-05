@@ -1,4 +1,0 @@
--------------------------------------------------------------------------------
-Test set: com.example.baseline.utils.http.HttpUtilTest
--------------------------------------------------------------------------------
-Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.047 s -- in com.example.baseline.utils.http.HttpUtilTest
