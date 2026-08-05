@@ -4,17 +4,21 @@ import com.example.baseline.dto.CallResult;
 import com.example.baseline.dto.ProcessRequest;
 import com.example.baseline.dto.ProcessResponse;
 import com.example.baseline.utils.config.ApplicationConfig.FastApiConfig;
-import com.example.baseline.utils.http.HttpUtil;
+import com.example.baseline.utils.python.PythonCallRequest;
+import com.example.baseline.utils.python.PythonCallResponse;
+import com.example.baseline.utils.python.PythonCallUtil;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import okhttp3.Response;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 public final class RestProcessingClient {
     private final FastApiConfig config;
@@ -38,29 +42,33 @@ public final class RestProcessingClient {
         Instant startTime = Instant.now();
         long startNs = System.nanoTime();
 
-        try (Response response = HttpUtil.callExternal(
-                config.processUrl(), config.method(), requestPayload, headers)) {
-            long endNs = System.nanoTime();
-            Instant endTime = Instant.now();
-            String responseBody = response.body() == null ? "" : response.body().string();
+        PythonCallResponse response = PythonCallUtil.call(new PythonCallRequest(
+                UUID.randomUUID().toString(),
+                config.method(),
+                URI.create(config.processUrl()),
+                headers,
+                requestPayload.toString().getBytes(StandardCharsets.UTF_8)
+        ));
+        long endNs = System.nanoTime();
+        Instant endTime = Instant.now();
+        String responseBody = response.bodyAsUtf8();
 
-            if (!response.isSuccessful()) {
-                throw new IOException(
-                        "HTTP request failed. status=" + response.code() + ", body=" + responseBody
-                );
-            }
-
-            ProcessResponse processResponse = objectMapper.readValue(responseBody, ProcessResponse.class);
-            return new CallResult(
-                    payload.requestId(),
-                    response.code(),
-                    startTime,
-                    endTime,
-                    (endNs - startNs) / 1_000_000.0,
-                    Thread.currentThread().getName(),
-                    processResponse
+        if (!response.isSuccessful()) {
+            throw new IOException(
+                    "HTTP request failed. status=" + response.statusCode() + ", body=" + responseBody
             );
         }
+
+        ProcessResponse processResponse = objectMapper.readValue(responseBody, ProcessResponse.class);
+        return new CallResult(
+                payload.requestId(),
+                response.statusCode(),
+                startTime,
+                endTime,
+                (endNs - startNs) / 1_000_000.0,
+                Thread.currentThread().getName(),
+                processResponse
+        );
     }
 
 }

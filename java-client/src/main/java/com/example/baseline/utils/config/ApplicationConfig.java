@@ -2,17 +2,33 @@ package com.example.baseline.utils.config;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 
+import com.example.baseline.utils.python.PythonCallMode;
+
+import java.nio.file.Path;
 import java.util.Map;
 
 public record ApplicationConfig(
         @JsonProperty("fast-api") FastApiConfig fastApi,
         WorkloadConfig workload,
-        @JsonProperty("http-client") HttpClientConfig httpClient
+        @JsonProperty("http-client") HttpClientConfig httpClient,
+        @JsonProperty("managed-python-runtime") ManagedPythonRuntimeConfig managedPythonRuntime
 ) {
     public ApplicationConfig {
-        if (fastApi == null || workload == null || httpClient == null) {
-            throw new IllegalArgumentException("fast-api, workload and http-client configuration are required");
+        if (fastApi == null || workload == null) {
+            throw new IllegalArgumentException("fast-api and workload configuration are required");
         }
+    }
+
+    public void validateFor(PythonCallMode mode) {
+        if (mode == PythonCallMode.HTTP && httpClient == null) {
+            throw new IllegalArgumentException("http-client configuration is required for HTTP mode");
+        }
+        if (mode == PythonCallMode.HTTP) httpClient.validate();
+        if (mode == PythonCallMode.MANAGED_RUNTIME && managedPythonRuntime == null) {
+            throw new IllegalArgumentException(
+                    "managed-python-runtime configuration is required for MANAGED_RUNTIME mode");
+        }
+        if (mode == PythonCallMode.MANAGED_RUNTIME) managedPythonRuntime.validate();
     }
 
     public record FastApiConfig(
@@ -47,7 +63,7 @@ public record ApplicationConfig(
             @JsonProperty("max-idle-connections") int maxIdleConnections,
             @JsonProperty("keep-alive-duration-ms") long keepAliveDurationMs
     ) {
-        public HttpClientConfig {
+        public void validate() {
             requireNonNegative(connectTimeoutMs, "http-client.connect-timeout-ms");
             requireNonNegative(readTimeoutMs, "http-client.read-timeout-ms");
             requireNonNegative(writeTimeoutMs, "http-client.write-timeout-ms");
@@ -57,11 +73,57 @@ public record ApplicationConfig(
         }
     }
 
+    public record ManagedPythonRuntimeConfig(
+            @JsonProperty("python-executable") String pythonExecutable,
+            @JsonProperty("application-directory") String applicationDirectory,
+            @JsonProperty("uds-directory") String udsDirectory,
+            @JsonProperty("queue-capacity") int queueCapacity,
+            @JsonProperty("max-frame-bytes") int maxFrameBytes,
+            @JsonProperty("startup-timeout-ms") long startupTimeoutMs,
+            @JsonProperty("request-timeout-ms") long requestTimeoutMs,
+            @JsonProperty("shutdown-timeout-ms") long shutdownTimeoutMs
+    ) {
+        public void validate() {
+            requireText(pythonExecutable, "managed-python-runtime.python-executable");
+            requireText(applicationDirectory, "managed-python-runtime.application-directory");
+            requireText(udsDirectory, "managed-python-runtime.uds-directory");
+            if (queueCapacity <= 0) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.queue-capacity must be greater than zero");
+            }
+            if (maxFrameBytes < 1024) {
+                throw new IllegalArgumentException(
+                        "managed-python-runtime.max-frame-bytes must be at least 1024");
+            }
+            requirePositive(startupTimeoutMs, "managed-python-runtime.startup-timeout-ms");
+            requirePositive(requestTimeoutMs, "managed-python-runtime.request-timeout-ms");
+            requirePositive(shutdownTimeoutMs, "managed-python-runtime.shutdown-timeout-ms");
+        }
+
+        public ManagedPythonRuntimeConfig normalized() {
+            validate();
+            return new ManagedPythonRuntimeConfig(
+                    pythonExecutable,
+                    Path.of(applicationDirectory).toAbsolutePath().normalize().toString(),
+                    Path.of(udsDirectory).toAbsolutePath().normalize().toString(),
+                    queueCapacity,
+                    maxFrameBytes,
+                    startupTimeoutMs,
+                    requestTimeoutMs,
+                    shutdownTimeoutMs
+            );
+        }
+    }
+
     private static void requireText(String value, String property) {
         if (value == null || value.isBlank()) throw new IllegalArgumentException(property + " must not be blank");
     }
 
     private static void requireNonNegative(long value, String property) {
         if (value < 0) throw new IllegalArgumentException(property + " must not be negative");
+    }
+
+    private static void requirePositive(long value, String property) {
+        if (value <= 0) throw new IllegalArgumentException(property + " must be greater than zero");
     }
 }

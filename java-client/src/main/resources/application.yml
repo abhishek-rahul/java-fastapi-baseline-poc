@@ -16,3 +16,13 @@ http-client:
   call-timeout-ms: 35000
   max-idle-connections: 5
   keep-alive-duration-ms: 300000
+
+managed-python-runtime:
+  python-executable: "python3"
+  application-directory: "../python-fastapi"
+  uds-directory: "../.managed-python-runtime"
+  queue-capacity: 64
+  max-frame-bytes: 1048576
+  startup-timeout-ms: 10000
+  request-timeout-ms: 35000
+  shutdown-timeout-ms: 5000

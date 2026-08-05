@@ -23,9 +23,12 @@ COPY python-fastapi/requirements.txt /app/python-fastapi/requirements.txt
 RUN pip install --no-cache-dir -r /app/python-fastapi/requirements.txt
 
 COPY python-fastapi/app /app/python-fastapi/app
+COPY python-fastapi/python_runtime /app/python-fastapi/python_runtime
 COPY --from=java-build /build/java-client/target/java-client-1.0.0.jar /app/java-client.jar
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh && mkdir -p /app/java-client
+
+WORKDIR /app/java-client
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker-entrypoint.sh"]
-CMD ["4"]
+CMD ["HTTP"]
